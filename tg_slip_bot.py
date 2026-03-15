@@ -3,18 +3,17 @@
 Thai Baht Payment Slip Tracking Telegram Bot
 Monitors group messages, tracks payment slips, detects duplicates, and provides reporting.
 All responses in Myanmar language (Burmese).
+Text-based slip detection only (no OCR/image processing).
 """
 
 import os
 import sqlite3
 import logging
 import re
-import io
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
-from pathlib import Path
 
-from telegram import Update, Chat
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,15 +21,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from telegram.error import TelegramError
-
-# Try to import OCR capabilities
-try:
-    import pytesseract
-    from PIL import Image
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -286,7 +276,7 @@ class SlipDatabase:
 
 
 class SlipDetector:
-    """Detect and extract payment slip information"""
+    """Detect and extract payment slip information from text"""
     
     # Thai Baht slip ID patterns
     SLIP_ID_PATTERNS = [
@@ -332,22 +322,6 @@ class SlipDetector:
         return slip_id, amount
     
     @staticmethod
-    def extract_from_image(image_path: str) -> Tuple[Optional[str], Optional[float]]:
-        """Extract slip ID and amount from image using OCR"""
-        if not OCR_AVAILABLE:
-            logger.warning("OCR not available, skipping image processing")
-            return None, None
-        
-        try:
-            image = Image.open(image_path)
-            text = pytesseract.image_to_string(image, lang='tha+eng')
-            logger.info(f"OCR extracted text: {text[:100]}")
-            return SlipDetector.extract_from_text(text)
-        except Exception as e:
-            logger.error(f"Error processing image: {e}")
-            return None, None
-    
-    @staticmethod
     def is_valid_slip(slip_id: Optional[str], amount: Optional[float]) -> bool:
         """Validate slip information"""
         if not slip_id or not amount:
@@ -367,9 +341,8 @@ class SlipDetector:
 class TelegramSlipBot:
     """Main Telegram bot handler"""
     
-    def __init__(self, token: str, group_id: int, special_user: str):
+    def __init__(self, token: str, special_user: str):
         self.token = token
-        self.group_id = group_id
         self.special_user = special_user
         self.db = SlipDatabase()
         self.detector = SlipDetector()
@@ -470,9 +443,9 @@ class TelegramSlipBot:
             await update.message.reply_text(MYANMAR_STRINGS['error_processing'])
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming messages with payment slip information"""
+        """Handle incoming text messages with payment slip information"""
         try:
-            if not update.message:
+            if not update.message or not update.message.text:
                 return
             
             # Determine transaction type based on sender
@@ -482,36 +455,8 @@ class TelegramSlipBot:
             
             transaction_type = MYANMAR_STRINGS['outgoing'] if is_special_user else MYANMAR_STRINGS['incoming']
             
-            slip_id = None
-            amount = None
-            
-            # Process photo attachments
-            if update.message.photo:
-                logger.info(f"Processing photo from {sender_username}")
-                
-                # Download the photo
-                photo_file = await update.message.photo[-1].get_file()
-                photo_path = f"/tmp/slip_{update.message.message_id}.jpg"
-                await photo_file.download_to_drive(photo_path)
-                
-                # Extract information from image
-                slip_id, amount = self.detector.extract_from_image(photo_path)
-                
-                # Clean up
-                try:
-                    os.remove(photo_path)
-                except:
-                    pass
-            
-            # Process text messages
-            if update.message.text:
-                text_slip_id, text_amount = self.detector.extract_from_text(update.message.text)
-                
-                # Use text extraction if image extraction didn't work
-                if not slip_id:
-                    slip_id = text_slip_id
-                if not amount:
-                    amount = text_amount
+            # Extract information from text message
+            slip_id, amount = self.detector.extract_from_text(update.message.text)
             
             # Validate and store if valid slip information found
             if self.detector.is_valid_slip(slip_id, amount):
@@ -543,11 +488,10 @@ class TelegramSlipBot:
                     await update.message.reply_text(alert)
                     logger.warning(f"Duplicate slip detected: {dup_slip_id}")
             else:
-                if update.message.text or update.message.photo:
-                    # Only alert if message looks like it might be a slip
-                    if slip_id or amount:
-                        await update.message.reply_text(MYANMAR_STRINGS['invalid_slip_alert'])
-                        logger.warning(f"Invalid slip from {sender_username}: ID={slip_id}, Amount={amount}")
+                # Only alert if message looks like it might be a slip
+                if slip_id or amount:
+                    await update.message.reply_text(MYANMAR_STRINGS['invalid_slip_alert'])
+                    logger.warning(f"Invalid slip from {sender_username}: ID={slip_id}, Amount={amount}")
         
         except Exception as e:
             logger.error(f"Error handling message: {e}")
@@ -564,9 +508,9 @@ class TelegramSlipBot:
         application.add_handler(CommandHandler("check", self.check_command))
         application.add_handler(CommandHandler("balance", self.balance_command))
         
-        # Add message handler for all messages
+        # Add message handler for text messages only
         application.add_handler(MessageHandler(
-            filters.TEXT | filters.PHOTO,
+            filters.TEXT & ~filters.COMMAND,
             self.handle_message
         ))
         
@@ -577,13 +521,12 @@ class TelegramSlipBot:
 def main():
     """Main entry point"""
     # Configuration
-    BOT_TOKEN = "8645961201:AAGDAHX0oIzTgJq-w1EALX3lcy7Poo-Fv0A"
+    BOT_TOKEN = "8214915771:AAEuffebveqtWAQpFmeHE_SxjeqD7Foyxyw"
     SPECIAL_USER = "Stttt298"  # Without @ symbol
     
     # Initialize and run bot
     bot = TelegramSlipBot(
         token=BOT_TOKEN,
-        group_id=None,  # Will monitor all groups
         special_user=SPECIAL_USER
     )
     
