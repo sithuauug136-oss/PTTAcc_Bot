@@ -4,12 +4,15 @@ Thai Baht Payment Slip Tracking Telegram Bot
 Monitors group messages, tracks payment slips, detects duplicates, and provides reporting.
 All responses in Myanmar language (Burmese).
 Text-based slip detection only (no OCR/image processing).
+Compatible with python-telegram-bot 20.7
 """
 
 import os
 import sqlite3
 import logging
 import re
+import signal
+import sys
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 
@@ -64,7 +67,7 @@ MYANMAR_STRINGS = {
 class SlipDatabase:
     """Database handler for payment slip records"""
     
-    def __init__(self, db_path: str = '/tmp/slip_records.db'):
+    def __init__(self, db_path: str = '/home/ubuntu/slip_records.db'):
         self.db_path = db_path
         self.init_db()
     
@@ -346,6 +349,7 @@ class TelegramSlipBot:
         self.special_user = special_user
         self.db = SlipDatabase()
         self.detector = SlipDetector()
+        self.application = None
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -496,26 +500,45 @@ class TelegramSlipBot:
         except Exception as e:
             logger.error(f"Error handling message: {e}")
     
+    async def post_init(self, application: Application) -> None:
+        """Post initialization hook"""
+        logger.info("Bot initialized and ready")
+    
+    async def post_stop(self, application: Application) -> None:
+        """Post stop hook"""
+        logger.info("Bot stopped")
+    
     def run(self):
         """Run the bot"""
-        application = Application.builder().token(self.token).build()
+        self.application = Application.builder().token(self.token).build()
+        
+        # Add post init and stop callbacks
+        self.application.post_init = self.post_init
+        self.application.post_stop = self.post_stop
         
         # Add command handlers
-        application.add_handler(CommandHandler("start", self.start))
-        application.add_handler(CommandHandler("help", self.help_command))
-        application.add_handler(CommandHandler("summary", self.summary_command))
-        application.add_handler(CommandHandler("list", self.list_command))
-        application.add_handler(CommandHandler("check", self.check_command))
-        application.add_handler(CommandHandler("balance", self.balance_command))
+        self.application.add_handler(CommandHandler("start", self.start))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("summary", self.summary_command))
+        self.application.add_handler(CommandHandler("list", self.list_command))
+        self.application.add_handler(CommandHandler("check", self.check_command))
+        self.application.add_handler(CommandHandler("balance", self.balance_command))
         
         # Add message handler for text messages only
-        application.add_handler(MessageHandler(
+        self.application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self.handle_message
         ))
         
         logger.info("Bot started and polling...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # Run with proper signal handling
+        try:
+            self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+        except KeyboardInterrupt:
+            logger.info("Bot interrupted by user")
+        except Exception as e:
+            logger.error(f"Bot error: {e}")
 
 
 def main():
