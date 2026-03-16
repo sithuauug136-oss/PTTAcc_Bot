@@ -64,7 +64,7 @@ MYANMAR_STRINGS = {
 class SlipDatabase:
     """Database handler for payment slip records"""
     
-    def __init__(self, db_path: str = '/home/ubuntu/slip_records.db'):
+    def __init__(self, db_path: str = '/tmp/slip_records.db'):
         self.db_path = db_path
         self.init_db()
     
