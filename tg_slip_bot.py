@@ -4,26 +4,30 @@ Thai Baht Payment Slip Tracking Telegram Bot
 Monitors group messages, tracks payment slips, detects duplicates, and provides reporting.
 All responses in Myanmar language (Burmese).
 Text-based slip detection only (no OCR/image processing).
-Compatible with python-telegram-bot 20.7
+Compatible with python-telegram-bot 13.x (Updater API)
 """
 
 import os
 import sqlite3
 import logging
 import re
-import signal
-import sys
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+try:
+    # Try importing from newer versions first
+    from telegram import Update
+    from telegram.ext import Updater, CommandHandler, MessageHandler, filters
+    USE_FILTERS = True
+    FILTERS_MODULE = filters
+except ImportError:
+    # Fall back to older version imports
+    from telegram import Update
+    from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+    USE_FILTERS = False
+    FILTERS_MODULE = Filters
+
+from telegram.error import TelegramError
 
 # Configure logging
 logging.basicConfig(
@@ -342,27 +346,26 @@ class SlipDetector:
 
 
 class TelegramSlipBot:
-    """Main Telegram bot handler"""
+    """Main Telegram bot handler using Updater API"""
     
     def __init__(self, token: str, special_user: str):
         self.token = token
         self.special_user = special_user
         self.db = SlipDatabase()
         self.detector = SlipDetector()
-        self.application = None
     
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def start(self, update: Update, context):
         """Handle /start command"""
-        await update.message.reply_text(
+        update.message.reply_text(
             f"{MYANMAR_STRINGS['welcome']}\n\n{MYANMAR_STRINGS['help_text']}"
         )
     
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def help_command(self, update: Update, context):
         """Handle /help command"""
         help_text = f"{MYANMAR_STRINGS['help_title']}\n{MYANMAR_STRINGS['help_text']}"
-        await update.message.reply_text(help_text)
+        update.message.reply_text(help_text)
     
-    async def summary_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def summary_command(self, update: Update, context):
         """Handle /summary command"""
         try:
             summary = self.db.get_today_summary()
@@ -372,12 +375,12 @@ class TelegramSlipBot:
             response += f"{MYANMAR_STRINGS['summary_out'].format(amount=summary['outgoing'])}\n"
             response += f"{MYANMAR_STRINGS['summary_balance'].format(amount=summary['balance'])}"
             
-            await update.message.reply_text(response)
+            update.message.reply_text(response)
         except Exception as e:
             logger.error(f"Error in summary command: {e}")
-            await update.message.reply_text(MYANMAR_STRINGS['error_processing'])
+            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
     
-    async def list_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def list_command(self, update: Update, context):
         """Handle /list command"""
         try:
             # Get date from arguments or use today
@@ -387,7 +390,7 @@ class TelegramSlipBot:
                 try:
                     datetime.strptime(date_str, '%Y-%m-%d')
                 except ValueError:
-                    await update.message.reply_text(MYANMAR_STRINGS['error_invalid_date'])
+                    update.message.reply_text(MYANMAR_STRINGS['error_invalid_date'])
                     return
             else:
                 date_str = datetime.now().strftime('%Y-%m-%d')
@@ -410,16 +413,16 @@ class TelegramSlipBot:
                     )
                     response += f"{item_str}\n"
             
-            await update.message.reply_text(response)
+            update.message.reply_text(response)
         except Exception as e:
             logger.error(f"Error in list command: {e}")
-            await update.message.reply_text(MYANMAR_STRINGS['error_processing'])
+            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
     
-    async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def check_command(self, update: Update, context):
         """Handle /check command"""
         try:
             if not context.args:
-                await update.message.reply_text(MYANMAR_STRINGS['error_invalid_slip_id'])
+                update.message.reply_text(MYANMAR_STRINGS['error_invalid_slip_id'])
                 return
             
             slip_id = context.args[0]
@@ -431,22 +434,22 @@ class TelegramSlipBot:
             else:
                 response = MYANMAR_STRINGS['check_not_found'].format(slip_id=slip_id)
             
-            await update.message.reply_text(response)
+            update.message.reply_text(response)
         except Exception as e:
             logger.error(f"Error in check command: {e}")
-            await update.message.reply_text(MYANMAR_STRINGS['error_processing'])
+            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
     
-    async def balance_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def balance_command(self, update: Update, context):
         """Handle /balance command"""
         try:
             balance = self.db.get_total_balance()
             response = MYANMAR_STRINGS['balance_current'].format(amount=balance)
-            await update.message.reply_text(response)
+            update.message.reply_text(response)
         except Exception as e:
             logger.error(f"Error in balance command: {e}")
-            await update.message.reply_text(MYANMAR_STRINGS['error_processing'])
+            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
     
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    def handle_message(self, update: Update, context):
         """Handle incoming text messages with payment slip information"""
         try:
             if not update.message or not update.message.text:
@@ -478,7 +481,7 @@ class TelegramSlipBot:
                         type=transaction_type,
                         amount=amount
                     )
-                    await update.message.reply_text(response)
+                    update.message.reply_text(response)
                     logger.info(f"Recorded slip {slip_id} from {sender_username}")
                 elif result.startswith('duplicate:'):
                     parts = result.split(':')
@@ -489,56 +492,48 @@ class TelegramSlipBot:
                         previous_user=prev_user,
                         previous_time=parts[3] if len(parts) > 3 else 'Unknown'
                     )
-                    await update.message.reply_text(alert)
+                    update.message.reply_text(alert)
                     logger.warning(f"Duplicate slip detected: {dup_slip_id}")
             else:
                 # Only alert if message looks like it might be a slip
                 if slip_id or amount:
-                    await update.message.reply_text(MYANMAR_STRINGS['invalid_slip_alert'])
+                    update.message.reply_text(MYANMAR_STRINGS['invalid_slip_alert'])
                     logger.warning(f"Invalid slip from {sender_username}: ID={slip_id}, Amount={amount}")
         
         except Exception as e:
             logger.error(f"Error handling message: {e}")
     
-    async def post_init(self, application: Application) -> None:
-        """Post initialization hook"""
-        logger.info("Bot initialized and ready")
-    
-    async def post_stop(self, application: Application) -> None:
-        """Post stop hook"""
-        logger.info("Bot stopped")
-    
     def run(self):
-        """Run the bot"""
-        self.application = Application.builder().token(self.token).build()
+        """Run the bot using Updater API"""
+        # Create the Updater and pass it your bot's token
+        updater = Updater(self.token, use_context=True)
         
-        # Add post init and stop callbacks
-        self.application.post_init = self.post_init
-        self.application.post_stop = self.post_stop
+        # Get the dispatcher to register handlers
+        dispatcher = updater.dispatcher
         
         # Add command handlers
-        self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("help", self.help_command))
-        self.application.add_handler(CommandHandler("summary", self.summary_command))
-        self.application.add_handler(CommandHandler("list", self.list_command))
-        self.application.add_handler(CommandHandler("check", self.check_command))
-        self.application.add_handler(CommandHandler("balance", self.balance_command))
+        dispatcher.add_handler(CommandHandler("start", self.start))
+        dispatcher.add_handler(CommandHandler("help", self.help_command))
+        dispatcher.add_handler(CommandHandler("summary", self.summary_command))
+        dispatcher.add_handler(CommandHandler("list", self.list_command))
+        dispatcher.add_handler(CommandHandler("check", self.check_command))
+        dispatcher.add_handler(CommandHandler("balance", self.balance_command))
         
         # Add message handler for text messages only
-        self.application.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self.handle_message
-        ))
+        if USE_FILTERS:
+            # For newer versions with filters module
+            dispatcher.add_handler(MessageHandler(FILTERS_MODULE.text & ~FILTERS_MODULE.command, self.handle_message))
+        else:
+            # For older versions with Filters class
+            dispatcher.add_handler(MessageHandler(FILTERS_MODULE.TEXT & ~FILTERS_MODULE.COMMAND, self.handle_message))
         
         logger.info("Bot started and polling...")
         
-        # Run with proper signal handling
-        try:
-            self.application.run_polling(allowed_updates=Update.ALL_TYPES)
-        except KeyboardInterrupt:
-            logger.info("Bot interrupted by user")
-        except Exception as e:
-            logger.error(f"Bot error: {e}")
+        # Start the Bot
+        updater.start_polling()
+        
+        # Run the bot until you press Ctrl-C or the process receives SIGINT, SIGTERM or SIGABRT
+        updater.idle()
 
 
 def main():
