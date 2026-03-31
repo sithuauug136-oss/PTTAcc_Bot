@@ -2,8 +2,14 @@
 """
 Facebook Messenger → Telegram Forwarder Bot
 ============================================
-Detects Myanmar Kyat slips (Wave=yellow, KBZ=blue) vs Thai Baht slips
-using image color analysis. No external API needed.
+Workflow:
+1. User sends slip image to FB Page
+2. Bot stores the slip (does NOT forward yet)
+3. Page Admin reacts (like/love/etc) to the message
+4. Bot forwards slip to correct TG group (kyat/baht)
+5. Bot replies to FB user: "ပြေစာလက်ခံရရှိပါပြီ။ ယူနစ်ဖြည့်ပေးနေပါပြီ။ ခဏစောင့်ပါ။ ကျေးဇူးတင်ပါတယ်။"
+
+Currency detection: image color analysis (Wave=yellow, KBZ=blue → kyat, else baht)
 """
 
 import os
@@ -37,6 +43,9 @@ TG_KYAT_GROUP = os.environ.get("TG_KYAT_GROUP", "@pttkyats")
 TG_API_BASE = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 FB_GRAPH_API = "https://graph.facebook.com/v18.0"
 
+# In-memory store: {message_id: {image_bytes, currency, target_group, caption, sender_id, sender_name}}
+pending_slips = {}
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -49,7 +58,7 @@ logging.basicConfig(
 logger = logging.getLogger("FBtoTG")
 
 # =============================================================================
-# Currency detection from caption text
+# Currency detection
 # =============================================================================
 
 BAHT_KEYWORDS = [
@@ -82,46 +91,28 @@ def detect_currency_from_text(text: str) -> str:
 
 
 def detect_currency_from_image(image_bytes: bytes) -> str:
-    """
-    Detect currency by analyzing dominant colors:
-    - Wave Money slip: bright YELLOW header (R>200, G>180, B<120)
-    - KBZ Bank slip: strong BLUE background (B>150, R<120, G<150)
-    - Thai bank slips: purple (SCB), green (KBank), or other colors
-    If yellow or blue dominant in top portion → kyat
-    Otherwise → baht
-    """
     if not PIL_AVAILABLE:
-        logger.warning("PIL not available - cannot analyze image")
         return "unknown"
-
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         width, height = img.size
-
-        # Analyze top 35% of image (bank logo/header area)
         top_height = int(height * 0.35)
         top_region = img.crop((0, 0, width, top_height))
         pixels = list(top_region.getdata())
         total = len(pixels)
-
         if total == 0:
             return "unknown"
 
-        yellow_count = 0   # Wave Money: bright yellow
-        blue_count = 0     # KBZ: deep blue
+        yellow_count = 0
+        blue_count = 0
         other_count = 0
 
         for r, g, b in pixels:
             brightness = (r + g + b) / 3
-
-            # Skip near-white and near-black
             if brightness > 235 or brightness < 15:
                 continue
-
-            # Yellow detection: R high, G high, B low
             if r > 180 and g > 160 and b < 120 and r > b + 80:
                 yellow_count += 1
-            # Blue detection: B dominant, R and G lower
             elif b > 130 and r < 130 and b > r + 40:
                 blue_count += 1
             else:
@@ -139,49 +130,39 @@ def detect_currency_from_image(image_bytes: bytes) -> str:
             f"blue: {blue_ratio:.3f} ({blue_count}), total colored: {colored}"
         )
 
-        # Wave Money = yellow
         if yellow_ratio > 0.15:
             logger.info("Detected: Myanmar Kyat (Wave Money - yellow)")
             return "kyat"
-
-        # KBZ = blue
         if blue_ratio > 0.10:
             logger.info("Detected: Myanmar Kyat (KBZ - blue)")
             return "kyat"
-
-        # Neither yellow nor blue → Thai Baht
         if yellow_ratio < 0.05 and blue_ratio < 0.05:
             logger.info("Detected: Thai Baht (no yellow/blue dominant)")
             return "baht"
-
-        logger.info("Color analysis inconclusive")
         return "unknown"
-
     except Exception as e:
         logger.error(f"Image color analysis error: {e}")
         return "unknown"
 
 
 def detect_currency(image_bytes: bytes, caption_text: str) -> str:
-    # 1. Try caption text first
     currency = detect_currency_from_text(caption_text)
     if currency != "unknown":
-        logger.info(f"Currency from text: {currency}")
         return currency
-
-    # 2. Try image color analysis
     if image_bytes:
         currency = detect_currency_from_image(image_bytes)
         if currency != "unknown":
             return currency
-
-    # 3. Default to baht if unknown
     logger.info("Currency unknown - defaulting to baht")
     return "baht"
 
 
+# =============================================================================
+# Facebook API helpers
+# =============================================================================
+
 def get_fb_user_profile(sender_id: str) -> dict:
-    profile = {"name": f"FB User {sender_id}", "id": sender_id}
+    profile = {"name": "Unknown", "id": sender_id}
     if not FB_PAGE_ACCESS_TOKEN:
         return profile
     try:
@@ -190,7 +171,9 @@ def get_fb_user_profile(sender_id: str) -> dict:
         resp = requests.get(url, params=params, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            profile["name"] = data.get("name", profile["name"])
+            if "name" in data:
+                profile["name"] = data["name"]
+                logger.info(f"FB profile fetched: {data['name']}")
     except Exception as e:
         logger.error(f"FB profile error: {e}")
     return profile
@@ -198,30 +181,14 @@ def get_fb_user_profile(sender_id: str) -> dict:
 
 def download_fb_image(image_url: str) -> bytes:
     try:
-        resp = requests.get(image_url, timeout=30)
+        headers = {"User-Agent": "facebookexternalua"}
+        resp = requests.get(image_url, headers=headers, timeout=30)
         if resp.status_code == 200:
             return resp.content
+        logger.error(f"Image download failed: {resp.status_code}")
     except Exception as e:
         logger.error(f"Image download error: {e}")
     return None
-
-
-def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str) -> bool:
-    try:
-        url = f"{TG_API_BASE}/sendPhoto"
-        files = {"photo": ("slip.jpg", photo_bytes, "image/jpeg")}
-        data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
-        resp = requests.post(url, files=files, data=data, timeout=30)
-        result = resp.json()
-        if result.get("ok"):
-            logger.info(f"Photo sent to {chat_id}")
-            return True
-        else:
-            logger.error(f"Telegram error: {result}")
-            return False
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
-        return False
 
 
 def send_fb_reply(sender_id: str, text: str):
@@ -231,19 +198,49 @@ def send_fb_reply(sender_id: str, text: str):
         url = f"{FB_GRAPH_API}/me/messages"
         params = {"access_token": FB_PAGE_ACCESS_TOKEN}
         payload = {"recipient": {"id": sender_id}, "message": {"text": text}}
-        requests.post(url, params=params, json=payload, timeout=10)
+        resp = requests.post(url, params=params, json=payload, timeout=10)
+        logger.info(f"FB reply sent to {sender_id}: {resp.status_code}")
     except Exception as e:
         logger.error(f"FB reply error: {e}")
 
 
-def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text: str = ""):
+# =============================================================================
+# Telegram API helpers
+# =============================================================================
+
+def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str) -> int:
+    try:
+        url = f"{TG_API_BASE}/sendPhoto"
+        files = {"photo": ("slip.jpg", photo_bytes, "image/jpeg")}
+        data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+        resp = requests.post(url, files=files, data=data, timeout=30)
+        result = resp.json()
+        if result.get("ok"):
+            msg_id = result["result"]["message_id"]
+            logger.info(f"Photo sent to {chat_id}, msg_id={msg_id}")
+            return msg_id
+        else:
+            logger.error(f"Telegram error: {result}")
+            return 0
+    except Exception as e:
+        logger.error(f"Telegram send error: {e}")
+        return 0
+
+
+# =============================================================================
+# Main logic
+# =============================================================================
+
+def store_pending_slip(message_id: str, image_url: str, sender_profile: dict, caption_text: str, sender_id: str):
+    """Download image and store slip pending admin reaction"""
     image_bytes = download_fb_image(image_url)
     if not image_bytes:
-        logger.error("Image download failed")
+        logger.error("Image download failed - cannot store slip")
         return False
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     currency = detect_currency(image_bytes, caption_text)
+    sender_name = sender_profile.get("name", "Unknown")
 
     if currency == "kyat":
         currency_label = "မြန်မာကျပ် (K)"
@@ -254,22 +251,51 @@ def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text
 
     tg_caption = (
         f"📋 <b>ငွေပေးချေမှု ပြေစာ</b>\n\n"
-        f"👤 ပို့သူ: {sender_profile.get('name', 'Unknown')}\n"
-        f"🆔 FB ID: {sender_profile.get('id', 'Unknown')}\n"
+        f"👤 ပို့သူ: {sender_name}\n"
         f"💰 ငွေကြေး: {currency_label}\n"
         f"🕐 အချိန်: {now_str}"
     )
-
     if caption_text:
         tg_caption += f"\n📝 မက်ဆေ့ချ်: {caption_text}"
 
-    if target_group:
-        success = send_telegram_photo(target_group, image_bytes, tg_caption)
-        if success:
-            logger.info(f"Forwarded to {target_group} ({currency})")
-        return success
+    pending_slips[message_id] = {
+        "image_bytes": image_bytes,
+        "target_group": target_group,
+        "caption": tg_caption,
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "currency": currency,
+        "timestamp": now_str,
+    }
+    logger.info(f"Slip stored pending admin reaction, msg_id={message_id}, currency={currency}, target={target_group}")
+    return True
 
-    return False
+
+def forward_pending_slip(message_id: str):
+    """Forward a stored slip to TG after admin reaction"""
+    slip = pending_slips.pop(message_id, None)
+    if not slip:
+        logger.warning(f"No pending slip found for msg_id={message_id}")
+        return False
+
+    target_group = slip["target_group"]
+    image_bytes = slip["image_bytes"]
+    caption = slip["caption"]
+    sender_id = slip["sender_id"]
+    sender_name = slip["sender_name"]
+
+    msg_id = send_telegram_photo(target_group, image_bytes, caption)
+    if msg_id:
+        logger.info(f"Slip forwarded to {target_group} for {sender_name}")
+        # Reply to FB user
+        send_fb_reply(
+            sender_id,
+            "ပြေစာလက်ခံရရှိပါပြီ။\nယူနစ်ဖြည့်ပေးနေပါပြီ။\nခဏစောင့်ပါ။\nကျေးဇူးတင်ပါတယ်။"
+        )
+        return True
+    else:
+        logger.error(f"Failed to forward slip to {target_group}")
+        return False
 
 
 # =============================================================================
@@ -285,6 +311,7 @@ def index():
         "status": "ok",
         "bot": "Facebook to Telegram Forwarder",
         "pil_available": PIL_AVAILABLE,
+        "pending_slips": len(pending_slips),
         "timestamp": datetime.now().isoformat(),
     })
 
@@ -318,6 +345,26 @@ def webhook_receive():
 def process_messaging_event(event: dict):
     try:
         sender_id = event.get("sender", {}).get("id", "")
+        recipient_id = event.get("recipient", {}).get("id", "")
+
+        # --- Handle admin reaction ---
+        # When admin reacts to a message, sender is the Page (admin), recipient is the user
+        reaction = event.get("reaction", {})
+        if reaction:
+            reaction_action = reaction.get("action", "")  # "react" or "unreact"
+            reacted_msg_id = str(reaction.get("mid", ""))
+            logger.info(f"Reaction event: action={reaction_action}, mid={reacted_msg_id}, sender={sender_id}")
+
+            # Only process "react" (not "unreact"), and only from Page admin (sender == page)
+            if reaction_action == "react" and sender_id == FB_PAGE_ID:
+                if reacted_msg_id in pending_slips:
+                    forward_pending_slip(reacted_msg_id)
+                else:
+                    logger.info(f"Reaction on non-pending message: {reacted_msg_id}")
+            return
+
+        # --- Handle incoming message from user ---
+        # Ignore messages sent by the Page itself
         if sender_id == FB_PAGE_ID:
             return
 
@@ -325,8 +372,9 @@ def process_messaging_event(event: dict):
         if not message:
             return
 
+        message_id = str(message.get("mid", ""))
         sender_profile = get_fb_user_profile(sender_id)
-        logger.info(f"Message from: {sender_profile.get('name', sender_id)}")
+        logger.info(f"Message from: {sender_profile.get('name', sender_id)}, mid={message_id}")
 
         attachments = message.get("attachments", [])
         message_text = message.get("text", "")
@@ -335,13 +383,14 @@ def process_messaging_event(event: dict):
             if attachment.get("type") == "image":
                 image_url = attachment.get("payload", {}).get("url", "")
                 if image_url:
-                    success = forward_image_to_telegram(
+                    logger.info(f"Processing image: {image_url[:80]}...")
+                    store_pending_slip(
+                        message_id=message_id,
                         image_url=image_url,
                         sender_profile=sender_profile,
                         caption_text=message_text,
+                        sender_id=sender_id,
                     )
-                    if success and FB_PAGE_ACCESS_TOKEN:
-                        send_fb_reply(sender_id, "✅ စလစ်ဓာတ်ပုံ လက်ခံရရှိပါပြီ။")
 
     except Exception as e:
         logger.error(f"Event processing error: {e}")
