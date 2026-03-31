@@ -2,10 +2,8 @@
 """
 Facebook Messenger → Telegram Forwarder Bot
 ============================================
-Receives payment slip images from Facebook Page Messenger via webhook,
-detects whether the slip is Thai Baht (ဘတ်) or Myanmar Kyat (ကျပ်)
-using image color analysis (no external API needed),
-and forwards the image with sender info to the appropriate Telegram group.
+Detects Myanmar Kyat slips (Wave=yellow, KBZ=blue) vs Thai Baht slips
+using image color analysis. No external API needed.
 """
 
 import os
@@ -51,7 +49,7 @@ logging.basicConfig(
 logger = logging.getLogger("FBtoTG")
 
 # =============================================================================
-# Currency detection keywords (from caption text)
+# Currency detection from caption text
 # =============================================================================
 
 BAHT_KEYWORDS = [
@@ -65,7 +63,7 @@ BAHT_KEYWORDS = [
 KYAT_KEYWORDS = [
     "kyat", "ကျပ်", "mmk", "မြန်မာ", "myanmar",
     "kbz", "kbzpay", "cb bank", "aya bank", "yoma bank",
-    "wave money", "wavepay", "ok dollar", "onepay",
+    "wave money", "wavepay", "wave", "ok dollar", "onepay",
     "ငွေလွှဲ", "ငွေလက်ခံ", "အောင်မြင်ပါသည်",
 ]
 
@@ -85,80 +83,79 @@ def detect_currency_from_text(text: str) -> str:
 
 def detect_currency_from_image(image_bytes: bytes) -> str:
     """
-    Detect currency by analyzing dominant colors in the image.
-    KBZ Bank (Myanmar Kyat) slips are predominantly blue (#1a3a6b or similar deep blue).
-    Thai bank slips: SCB=purple, KBank=green, BBL=blue (lighter), Promptpay=various.
-    
-    Strategy:
-    - Count blue pixels in the top portion of the image (where bank logo usually is)
-    - KBZ blue is a specific deep/navy blue: R<100, G<120, B>150
-    - Thai bank logos tend to be lighter or different hues
+    Detect currency by analyzing dominant colors:
+    - Wave Money slip: bright YELLOW header (R>200, G>180, B<120)
+    - KBZ Bank slip: strong BLUE background (B>150, R<120, G<150)
+    - Thai bank slips: purple (SCB), green (KBank), or other colors
+    If yellow or blue dominant in top portion → kyat
+    Otherwise → baht
     """
     if not PIL_AVAILABLE:
-        logger.warning("PIL not available - cannot analyze image colors")
+        logger.warning("PIL not available - cannot analyze image")
         return "unknown"
 
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         width, height = img.size
 
-        # Analyze top 30% of image (where bank logo/header usually is)
-        top_height = int(height * 0.30)
+        # Analyze top 35% of image (bank logo/header area)
+        top_height = int(height * 0.35)
         top_region = img.crop((0, 0, width, top_height))
         pixels = list(top_region.getdata())
-
         total = len(pixels)
+
         if total == 0:
             return "unknown"
 
-        # Count color categories
-        kbz_blue = 0      # KBZ deep blue: R<120, G<150, B>150
-        thai_purple = 0   # SCB purple: R>100, G<100, B>100
-        thai_green = 0    # KBank green: G > R+50 and G > B+30
-        white_count = 0   # White/light background
+        yellow_count = 0   # Wave Money: bright yellow
+        blue_count = 0     # KBZ: deep blue
+        other_count = 0
 
         for r, g, b in pixels:
             brightness = (r + g + b) / 3
 
-            # Skip very dark or very white pixels
-            if brightness > 230:
-                white_count += 1
-                continue
-            if brightness < 20:
+            # Skip near-white and near-black
+            if brightness > 235 or brightness < 15:
                 continue
 
-            # KBZ-style deep blue (navy blue)
-            if b > 120 and r < 120 and g < 140 and b > r + 30 and b > g + 10:
-                kbz_blue += 1
-            # SCB purple
-            elif r > 100 and b > 100 and g < 80:
-                thai_purple += 1
-            # KBank green
-            elif g > r + 40 and g > b + 20 and g > 100:
-                thai_green += 1
+            # Yellow detection: R high, G high, B low
+            if r > 180 and g > 160 and b < 120 and r > b + 80:
+                yellow_count += 1
+            # Blue detection: B dominant, R and G lower
+            elif b > 130 and r < 130 and b > r + 40:
+                blue_count += 1
+            else:
+                other_count += 1
 
-        non_white = total - white_count
-        if non_white == 0:
+        colored = yellow_count + blue_count + other_count
+        if colored == 0:
             return "unknown"
 
-        kbz_ratio = kbz_blue / non_white
-        thai_ratio = (thai_purple + thai_green) / non_white
+        yellow_ratio = yellow_count / colored
+        blue_ratio = blue_count / colored
 
-        logger.info(f"Color analysis - KBZ blue: {kbz_ratio:.3f}, Thai: {thai_ratio:.3f}, total pixels: {total}")
+        logger.info(
+            f"Color analysis - yellow: {yellow_ratio:.3f} ({yellow_count}), "
+            f"blue: {blue_ratio:.3f} ({blue_count}), total colored: {colored}"
+        )
 
-        # Decision
-        if kbz_ratio > 0.08:
-            logger.info("Detected: Myanmar Kyat (KBZ blue dominant)")
+        # Wave Money = yellow
+        if yellow_ratio > 0.15:
+            logger.info("Detected: Myanmar Kyat (Wave Money - yellow)")
             return "kyat"
-        elif thai_ratio > 0.05:
-            logger.info("Detected: Thai Baht (Thai bank color)")
+
+        # KBZ = blue
+        if blue_ratio > 0.10:
+            logger.info("Detected: Myanmar Kyat (KBZ - blue)")
+            return "kyat"
+
+        # Neither yellow nor blue → Thai Baht
+        if yellow_ratio < 0.05 and blue_ratio < 0.05:
+            logger.info("Detected: Thai Baht (no yellow/blue dominant)")
             return "baht"
-        elif kbz_ratio > thai_ratio and kbz_ratio > 0.03:
-            logger.info("Detected: Myanmar Kyat (KBZ blue slightly dominant)")
-            return "kyat"
-        else:
-            logger.info("Color analysis inconclusive")
-            return "unknown"
+
+        logger.info("Color analysis inconclusive")
+        return "unknown"
 
     except Exception as e:
         logger.error(f"Image color analysis error: {e}")
@@ -166,10 +163,7 @@ def detect_currency_from_image(image_bytes: bytes) -> str:
 
 
 def detect_currency(image_bytes: bytes, caption_text: str) -> str:
-    """
-    Try text detection first, then image color analysis.
-    """
-    # 1. Try caption text first (most reliable if user adds it)
+    # 1. Try caption text first
     currency = detect_currency_from_text(caption_text)
     if currency != "unknown":
         logger.info(f"Currency from text: {currency}")
@@ -179,10 +173,11 @@ def detect_currency(image_bytes: bytes, caption_text: str) -> str:
     if image_bytes:
         currency = detect_currency_from_image(image_bytes)
         if currency != "unknown":
-            logger.info(f"Currency from image: {currency}")
             return currency
 
-    return "unknown"
+    # 3. Default to baht if unknown
+    logger.info("Currency unknown - defaulting to baht")
+    return "baht"
 
 
 def get_fb_user_profile(sender_id: str) -> dict:
@@ -250,12 +245,12 @@ def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     currency = detect_currency(image_bytes, caption_text)
 
-    if currency == "baht":
-        currency_label = "ထိုင်းဘတ် (฿)"
-    elif currency == "kyat":
+    if currency == "kyat":
         currency_label = "မြန်မာကျပ် (K)"
+        target_group = TG_KYAT_GROUP
     else:
-        currency_label = "မသိ (Unknown)"
+        currency_label = "ထိုင်းဘတ် (฿)"
+        target_group = TG_BAHT_GROUP
 
     tg_caption = (
         f"📋 <b>ငွေပေးချေမှု ပြေစာ</b>\n\n"
@@ -268,27 +263,13 @@ def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text
     if caption_text:
         tg_caption += f"\n📝 မက်ဆေ့ချ်: {caption_text}"
 
-    success = False
-
-    if currency == "kyat":
-        if TG_KYAT_GROUP:
-            success = send_telegram_photo(TG_KYAT_GROUP, image_bytes, tg_caption)
-            if success:
-                logger.info("Forwarded to Kyat group")
-    elif currency == "baht":
-        if TG_BAHT_GROUP:
-            success = send_telegram_photo(TG_BAHT_GROUP, image_bytes, tg_caption)
-            if success:
-                logger.info("Forwarded to Baht group")
-    else:
-        # Unknown - send to both groups
-        s1 = send_telegram_photo(TG_BAHT_GROUP, image_bytes, tg_caption) if TG_BAHT_GROUP else False
-        s2 = send_telegram_photo(TG_KYAT_GROUP, image_bytes, tg_caption) if TG_KYAT_GROUP else False
-        success = s1 or s2
+    if target_group:
+        success = send_telegram_photo(target_group, image_bytes, tg_caption)
         if success:
-            logger.info("Forwarded to both groups (unknown currency)")
+            logger.info(f"Forwarded to {target_group} ({currency})")
+        return success
 
-    return success
+    return False
 
 
 # =============================================================================
@@ -325,11 +306,9 @@ def webhook_receive():
         body = request.get_json()
         if not body or body.get("object") != "page":
             return "OK", 200
-
         for entry in body.get("entry", []):
             for event in entry.get("messaging", []):
                 process_messaging_event(event)
-
         return "OK", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -367,10 +346,6 @@ def process_messaging_event(event: dict):
     except Exception as e:
         logger.error(f"Event processing error: {e}")
 
-
-# =============================================================================
-# Main
-# =============================================================================
 
 def main():
     logger.info("Facebook to Telegram Bot started")
