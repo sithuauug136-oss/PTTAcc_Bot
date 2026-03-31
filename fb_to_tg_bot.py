@@ -331,15 +331,32 @@ def webhook_verify():
 def webhook_receive():
     try:
         body = request.get_json()
+        logger.info(f"Webhook body keys: {list(body.keys()) if body else 'empty'}")
         if not body or body.get("object") != "page":
             return "OK", 200
         for entry in body.get("entry", []):
+            logger.info(f"Entry keys: {list(entry.keys())}")
+            # Handle messaging events
             for event in entry.get("messaging", []):
                 process_messaging_event(event)
+            # Handle changes (reactions may come here in some API versions)
+            for change in entry.get("changes", []):
+                logger.info(f"Change field: {change.get('field')}, value keys: {list(change.get('value', {}).keys())}")
+                process_change_event(change)
         return "OK", 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return "OK", 200
+
+
+def process_change_event(change: dict):
+    """Handle changes field events (some reaction events come here)"""
+    try:
+        field = change.get("field", "")
+        value = change.get("value", {})
+        logger.info(f"Change event - field: {field}, value: {value}")
+    except Exception as e:
+        logger.error(f"Change event error: {e}")
 
 
 def process_messaging_event(event: dict):
@@ -355,12 +372,22 @@ def process_messaging_event(event: dict):
             reacted_msg_id = str(reaction.get("mid", ""))
             logger.info(f"Reaction event: action={reaction_action}, mid={reacted_msg_id}, sender={sender_id}")
 
-            # Only process "react" (not "unreact"), and only from Page admin (sender == page)
-            if reaction_action == "react" and sender_id == FB_PAGE_ID:
+            # Process any "react" action - from any sender (admin or page)
+            if reaction_action == "react":
+                logger.info(f"React from sender={sender_id}, page_id={FB_PAGE_ID}, pending={list(pending_slips.keys())}")
                 if reacted_msg_id in pending_slips:
                     forward_pending_slip(reacted_msg_id)
                 else:
-                    logger.info(f"Reaction on non-pending message: {reacted_msg_id}")
+                    # Try matching without prefix differences
+                    matched = None
+                    for key in pending_slips:
+                        if key.endswith(reacted_msg_id) or reacted_msg_id.endswith(key):
+                            matched = key
+                            break
+                    if matched:
+                        forward_pending_slip(matched)
+                    else:
+                        logger.info(f"Reaction on non-pending message: {reacted_msg_id}, pending keys: {list(pending_slips.keys())}")
             return
 
         # --- Handle incoming message from user ---
