@@ -4,10 +4,15 @@ Facebook Messenger → Telegram Forwarder Bot
 ============================================
 Receives payment slip images from Facebook Page Messenger via webhook,
 detects whether the slip is Thai Baht (ဘတ်) or Myanmar Kyat (ကျပ်),
+detects IN/OUT based on recipient/sender name in slip,
 and forwards the image with sender info to the appropriate Telegram group.
 
+IN/OUT Rules:
+- Baht slip: TO = HMU PAING SOE or NAY LIN SOE → IN; FROM = those names → OUT
+- Kyat slip: TO = SI THU AUNG → IN; otherwise → OUT
+
 All logs and responses are in Myanmar (Burmese) language.
-Compatible with Python 3.11 and Railway deployment.
+Compatible with Python 3.11 and Render deployment.
 """
 
 import os
@@ -15,7 +20,7 @@ import sys
 import json
 import logging
 import re
-import tempfile
+import base64
 from datetime import datetime
 
 import requests
@@ -35,13 +40,26 @@ FB_VERIFY_TOKEN = os.environ.get("FB_VERIFY_TOKEN", "PTTFBBot_verify_2024_secure
 # Telegram credentials
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "8744118866:AAGD_QJZxMTkMgHdDFbuSZy8zUZpf9d9ris")
 TG_BAHT_GROUP = os.environ.get("TG_BAHT_GROUP", "@ptttbath")
-TG_KYAT_GROUP = os.environ.get("TG_KYAT_GROUP", "")  # Set via env or use chat_id
+TG_KYAT_GROUP = os.environ.get("TG_KYAT_GROUP", "")
+
+# OpenAI API key (for Vision OCR)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 # Telegram API base URL
 TG_API_BASE = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # Facebook Graph API base URL
 FB_GRAPH_API = "https://graph.facebook.com/v18.0"
+
+# =============================================================================
+# IN/OUT name rules
+# =============================================================================
+
+# Baht slip: if these names appear in TO field → IN
+BAHT_IN_NAMES = ["HMU PAING SOE", "NAY LIN SOE", "HMUPAIGSOE", "NAYLINSOE"]
+
+# Kyat slip: if SI THU AUNG appears in TO field → IN
+KYAT_IN_NAMES = ["SI THU AUNG", "SITHUAUNG"]
 
 # =============================================================================
 # Logging
@@ -72,7 +90,7 @@ MY = {
     "detection_unknown": "❓ ငွေကြေးအမျိုးအစား မသိရှိပါ - အုပ်စုနှစ်ခုလုံးသို့ ပို့ပါမည်",
     "no_token": "⚠️ FB_PAGE_ACCESS_TOKEN မရှိပါ - Facebook API ကို အသုံးပြု၍မရပါ",
     "sender_info": "👤 ပို့သူ: {name}\n🆔 Facebook ID: {id}\n🕐 အချိန်: {time}",
-    "slip_caption": "📋 စလစ်အချက်အလက်:\n👤 ပို့သူ: {name}\n🆔 FB ID: {fb_id}\n💰 ငွေကြေး: {currency}\n🕐 အချိန်: {time}",
+    "slip_caption": "📋 စလစ်အချက်အလက်:\n👤 FB ပို့သူ: {name}\n💰 ငွေကြေး: {currency}\n📊 အမျိုးအစား: {direction}\n💵 ပမာဏ: {amount}\n🕐 အချိန်: {time}",
     "text_received": "📝 စာသား လက်ခံရရှိပါပြီ - ပို့သူ: {sender}",
     "error_download": "❌ ဓာတ်ပုံ ဒေါင်းလုဒ် အမှားဖြစ်ပါသည်",
     "error_processing": "❌ မက်ဆေ့ချ် လုပ်ဆောင်ရာတွင် အမှားဖြစ်ပါသည်",
@@ -124,6 +142,133 @@ def detect_currency(text: str) -> str:
         return "unknown"
 
 
+def analyze_slip_with_vision(image_bytes: bytes) -> dict:
+    """
+    Use OpenAI Vision API to extract slip info: currency, from_name, to_name, amount.
+    Returns dict with keys: currency, from_name, to_name, amount, direction
+    """
+    result = {
+        "currency": "unknown",
+        "from_name": "",
+        "to_name": "",
+        "amount": "မသိ",
+        "direction": "မသိ",
+    }
+
+    if not OPENAI_API_KEY:
+        logger.warning("No OPENAI_API_KEY - skipping Vision analysis")
+        return result
+
+    try:
+        # Encode image to base64
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        prompt = """Look at this payment slip image and extract the following information in JSON format:
+{
+  "currency": "baht" or "kyat" or "unknown",
+  "from_name": "sender name in the slip (FROM field)",
+  "to_name": "recipient name in the slip (TO field)",
+  "amount": "amount number only"
+}
+
+Rules for currency detection:
+- If you see Thai bank names (SCB, KBank, BBL, etc), Thai text, ฿, บาท → currency = "baht"
+- If you see KBZ, CB Bank, AYA, Wave Money, Myanmar text, K, MMK → currency = "kyat"
+
+Return ONLY the JSON, no extra text."""
+
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}",
+                                "detail": "low"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 200,
+        }
+
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30,
+        )
+
+        if resp.status_code == 200:
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            logger.info(f"Vision API response: {content}")
+
+            # Parse JSON from response
+            # Remove markdown code blocks if present
+            content = re.sub(r"```json\s*", "", content)
+            content = re.sub(r"```\s*", "", content)
+            parsed = json.loads(content)
+
+            result["currency"] = parsed.get("currency", "unknown")
+            result["from_name"] = parsed.get("from_name", "").upper().strip()
+            result["to_name"] = parsed.get("to_name", "").upper().strip()
+            result["amount"] = parsed.get("amount", "မသိ")
+
+            # Determine IN/OUT direction
+            currency = result["currency"]
+            to_name = result["to_name"]
+            from_name = result["from_name"]
+
+            if currency == "baht":
+                # Check if TO name matches our IN names
+                is_in = any(
+                    name in to_name or name in to_name.replace(" ", "")
+                    for name in BAHT_IN_NAMES
+                )
+                is_out = any(
+                    name in from_name or name in from_name.replace(" ", "")
+                    for name in BAHT_IN_NAMES
+                )
+                if is_in:
+                    result["direction"] = "✅ IN (ငွေဝင်)"
+                elif is_out:
+                    result["direction"] = "❌ OUT (ငွေထုတ်)"
+                else:
+                    result["direction"] = "❓ မသိ"
+
+            elif currency == "kyat":
+                # Check if TO name is SI THU AUNG → IN, else OUT
+                is_in = any(
+                    name in to_name or name in to_name.replace(" ", "")
+                    for name in KYAT_IN_NAMES
+                )
+                if is_in:
+                    result["direction"] = "✅ IN (ငွေဝင်)"
+                else:
+                    result["direction"] = "❌ OUT (ငွေထုတ်)"
+
+            else:
+                result["direction"] = "❓ မသိ"
+
+        else:
+            logger.error(f"Vision API error: {resp.status_code} - {resp.text}")
+
+    except Exception as e:
+        logger.error(f"Vision analysis error: {e}")
+
+    return result
+
+
 def get_fb_user_profile(sender_id: str) -> dict:
     """
     Fetch Facebook user profile information.
@@ -171,14 +316,6 @@ def download_fb_image(image_url: str) -> bytes:
     except Exception as e:
         logger.error(f"Image download error: {e}")
         return None
-
-
-def get_fb_attachment_url(attachment_url: str) -> str:
-    """
-    Get the actual image URL from Facebook attachment.
-    If a PAGE_ACCESS_TOKEN is available, use it to get a higher-res version.
-    """
-    return attachment_url
 
 
 def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str, filename: str = "slip.jpg") -> bool:
@@ -264,7 +401,7 @@ def send_fb_reply(sender_id: str, message_text: str) -> bool:
 
 def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text: str = ""):
     """
-    Download image from Facebook and forward to appropriate Telegram group(s).
+    Download image from Facebook, analyze with Vision API, and forward to appropriate Telegram group(s).
     """
     # Download the image
     image_bytes = download_fb_image(image_url)
@@ -272,11 +409,22 @@ def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text
         logger.error(MY["error_download"])
         return False
 
-    # Detect currency from any caption text
-    currency = detect_currency(caption_text)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Build caption for Telegram
+    # Analyze slip with Vision API
+    slip_info = analyze_slip_with_vision(image_bytes)
+    currency = slip_info["currency"]
+    direction = slip_info["direction"]
+    amount = slip_info["amount"]
+    from_name = slip_info["from_name"] or "မသိ"
+    to_name = slip_info["to_name"] or "မသိ"
+
+    # Fallback: detect currency from caption text if Vision failed
+    if currency == "unknown" and caption_text:
+        currency = detect_currency(caption_text)
+        slip_info["currency"] = currency
+
+    # Build currency label
     if currency == "baht":
         currency_label = "ထိုင်းဘတ် (฿)"
         logger.info(MY["detection_baht"])
@@ -287,14 +435,18 @@ def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text
         currency_label = "မသိရှိ (Unknown)"
         logger.info(MY["detection_unknown"])
 
-    tg_caption = MY["slip_caption"].format(
-        name=sender_profile.get("name", "Unknown"),
-        fb_id=sender_profile.get("id", "Unknown"),
-        currency=currency_label,
-        time=now_str,
+    # Build Telegram caption
+    tg_caption = (
+        f"📋 <b>စလစ်အချက်အလက်</b>\n\n"
+        f"👤 FB ပို့သူ: {sender_profile.get('name', 'Unknown')}\n"
+        f"💰 ငွေကြေး: {currency_label}\n"
+        f"📊 အမျိုးအစား: <b>{direction}</b>\n"
+        f"💵 ပမာဏ: {amount}\n"
+        f"📤 FROM: {from_name}\n"
+        f"📥 TO: {to_name}\n"
+        f"🕐 အချိန်: {now_str}"
     )
 
-    # Add original caption text if present
     if caption_text:
         tg_caption += f"\n📝 မက်ဆေ့ချ်: {caption_text}"
 
@@ -302,13 +454,11 @@ def forward_image_to_telegram(image_url: str, sender_profile: dict, caption_text
     success = False
 
     if currency == "baht":
-        # Forward to Baht group only
         if TG_BAHT_GROUP:
             success = send_telegram_photo(TG_BAHT_GROUP, image_bytes, tg_caption)
             if success:
                 logger.info(MY["forwarded_baht"])
     elif currency == "kyat":
-        # Forward to Kyat group only
         if TG_KYAT_GROUP:
             success = send_telegram_photo(TG_KYAT_GROUP, image_bytes, tg_caption)
             if success:
@@ -365,7 +515,6 @@ def forward_text_to_telegram(text: str, sender_profile: dict):
         if TG_KYAT_GROUP:
             success = send_telegram_message(TG_KYAT_GROUP, tg_message)
     else:
-        # Forward to both if unknown
         s1 = send_telegram_message(TG_BAHT_GROUP, tg_message) if TG_BAHT_GROUP else False
         s2 = send_telegram_message(TG_KYAT_GROUP, tg_message) if TG_KYAT_GROUP else False
         success = s1 or s2
@@ -395,7 +544,6 @@ def index():
 def webhook_verify():
     """
     Facebook webhook verification endpoint.
-    Facebook sends a GET request with hub.mode, hub.verify_token, and hub.challenge.
     """
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
@@ -415,7 +563,6 @@ def webhook_verify():
 def webhook_receive():
     """
     Facebook webhook message receiver.
-    Processes incoming messages from Facebook Messenger.
     """
     try:
         body = request.get_json()
@@ -425,16 +572,12 @@ def webhook_receive():
             return "OK", 200
 
         logger.info(MY["msg_received"])
-        logger.debug(f"Webhook body: {json.dumps(body, indent=2)}")
 
-        # Verify this is a page subscription event
         if body.get("object") != "page":
             logger.warning(f"Unexpected object type: {body.get('object')}")
             return "OK", 200
 
-        # Process each entry
         for entry in body.get("entry", []):
-            # Process each messaging event
             for messaging_event in entry.get("messaging", []):
                 process_messaging_event(messaging_event)
 
@@ -451,7 +594,6 @@ def process_messaging_event(event: dict):
     """
     try:
         sender_id = event.get("sender", {}).get("id", "")
-        recipient_id = event.get("recipient", {}).get("id", "")
 
         # Ignore messages sent by the page itself
         if sender_id == FB_PAGE_ID:
@@ -467,7 +609,6 @@ def process_messaging_event(event: dict):
         sender_profile = get_fb_user_profile(sender_id)
         logger.info(MY["image_received"].format(sender=sender_profile.get("name", sender_id)))
 
-        # Check for attachments (images/photos)
         attachments = message.get("attachments", [])
         message_text = message.get("text", "")
 
@@ -487,18 +628,15 @@ def process_messaging_event(event: dict):
                         caption_text=message_text,
                     )
 
-                    # Reply to sender on Facebook
                     if success and FB_PAGE_ACCESS_TOKEN:
                         send_fb_reply(
                             sender_id,
                             "✅ စလစ်ဓာတ်ပုံ လက်ခံရရှိပါပြီ။ စစ်ဆေးပေးပါမည်။"
                         )
 
-        # If no image but has text with potential slip info, forward text
         if not has_image and message_text:
             logger.info(MY["text_received"].format(sender=sender_profile.get("name", sender_id)))
 
-            # Check if text contains currency-related keywords
             currency = detect_currency(message_text)
             if currency != "unknown":
                 forward_text_to_telegram(message_text, sender_profile)
@@ -522,12 +660,11 @@ def main():
     logger.info(MY["bot_start"])
     logger.info(f"FB Page ID: {FB_PAGE_ID}")
     logger.info(f"TG Baht Group: {TG_BAHT_GROUP}")
-    logger.info(f"TG Kyat Group: {TG_KYAT_GROUP or '(not set - use TG_KYAT_GROUP env var)'}")
-    logger.info(f"Verify Token: {FB_VERIFY_TOKEN}")
+    logger.info(f"TG Kyat Group: {TG_KYAT_GROUP or '(not set)'}")
+    logger.info(f"OpenAI Vision: {'enabled' if OPENAI_API_KEY else 'disabled'}")
 
     if not FB_PAGE_ACCESS_TOKEN:
         logger.warning(MY["no_token"])
-        logger.warning("Set FB_PAGE_ACCESS_TOKEN environment variable to enable full functionality")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
