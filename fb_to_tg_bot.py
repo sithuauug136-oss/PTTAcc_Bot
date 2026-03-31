@@ -7,7 +7,7 @@ Workflow:
 2. Bot stores the slip (does NOT forward yet)
 3. Page Admin reacts (like/love/etc) to the message
 4. Bot forwards slip to correct TG group (kyat/baht)
-5. Bot replies to FB user: "ပြေစာလက်ခံရရှိပါပြီ။ ယူနစ်ဖြည့်ပေးနေပါပြီ။ ခဏစောင့်ပါ။ ကျေးဇူးတင်ပါတယ်။"
+5. Bot replies to FB user: "✅ ပြေစာရပါပြီ။ ⏳ ယူနစ်ဖြည့်ပေးနေပါပြီ၊ ခဏစောင့်ပါ။ 🙏 ကျေးဇူးတင်ပါတယ်ခင်ဗျာ။"
 
 Currency detection: image color analysis (Wave=yellow, KBZ=blue → kyat, else baht)
 """
@@ -290,7 +290,7 @@ def forward_pending_slip(message_id: str):
         # Reply to FB user
         send_fb_reply(
             sender_id,
-            "ပြေစာလက်ခံရရှိပါပြီ။\nယူနစ်ဖြည့်ပေးနေပါပြီ။\nခဏစောင့်ပါ။\nကျေးဇူးတင်ပါတယ်။"
+            "✅ ပြေစာရပါပြီ။\n⏳ ယူနစ်ဖြည့်ပေးနေပါပြီ၊ ခဏစောင့်ပါ။\n🙏 ကျေးဇူးတင်ပါတယ်ခင်ဗျာ။"
         )
         return True
     else:
