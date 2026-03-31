@@ -359,52 +359,46 @@ def process_change_event(change: dict):
         logger.error(f"Change event error: {e}")
 
 
+# Keywords that admin sends to approve a slip
+ADMIN_APPROVE_KEYWORDS = ["ok", "done", "✅", "okay", "yes", "approve", "ပြီး", "ပြီ", "ရပြီ"]
+
+
 def process_messaging_event(event: dict):
     try:
         sender_id = event.get("sender", {}).get("id", "")
         recipient_id = event.get("recipient", {}).get("id", "")
-
-        # --- Handle admin reaction ---
-        # When admin reacts to a message, sender is the Page (admin), recipient is the user
-        reaction = event.get("reaction", {})
-        if reaction:
-            reaction_action = reaction.get("action", "")  # "react" or "unreact"
-            reacted_msg_id = str(reaction.get("mid", ""))
-            logger.info(f"Reaction event: action={reaction_action}, mid={reacted_msg_id}, sender={sender_id}")
-
-            # Process any "react" action - from any sender (admin or page)
-            if reaction_action == "react":
-                logger.info(f"React from sender={sender_id}, page_id={FB_PAGE_ID}, pending={list(pending_slips.keys())}")
-                if reacted_msg_id in pending_slips:
-                    forward_pending_slip(reacted_msg_id)
-                else:
-                    # Try matching without prefix differences
-                    matched = None
-                    for key in pending_slips:
-                        if key.endswith(reacted_msg_id) or reacted_msg_id.endswith(key):
-                            matched = key
-                            break
-                    if matched:
-                        forward_pending_slip(matched)
-                    else:
-                        logger.info(f"Reaction on non-pending message: {reacted_msg_id}, pending keys: {list(pending_slips.keys())}")
-            return
-
-        # --- Handle incoming message from user ---
-        # Ignore messages sent by the Page itself
-        if sender_id == FB_PAGE_ID:
-            return
 
         message = event.get("message", {})
         if not message:
             return
 
         message_id = str(message.get("mid", ""))
+        message_text = (message.get("text") or "").strip()
+        attachments = message.get("attachments", [])
+
+        # --- Handle admin approval message ---
+        # Admin sends from Page (sender_id == FB_PAGE_ID) to a user
+        # The recipient is the user whose slip is pending
+        if sender_id == FB_PAGE_ID:
+            if message_text.lower() in ADMIN_APPROVE_KEYWORDS or message_text in ADMIN_APPROVE_KEYWORDS:
+                # recipient_id is the user the admin is replying to
+                logger.info(f"Admin approval message '{message_text}' to user {recipient_id}")
+                # Find pending slip for this recipient
+                matched_key = None
+                for key, slip in pending_slips.items():
+                    if slip.get("sender_id") == recipient_id:
+                        matched_key = key
+                        break
+                if matched_key:
+                    logger.info(f"Found pending slip {matched_key} for user {recipient_id} - forwarding")
+                    forward_pending_slip(matched_key)
+                else:
+                    logger.info(f"No pending slip for user {recipient_id}, pending: {list(pending_slips.keys())}")
+            return
+
+        # --- Handle incoming message from user ---
         sender_profile = get_fb_user_profile(sender_id)
         logger.info(f"Message from: {sender_profile.get('name', sender_id)}, mid={message_id}")
-
-        attachments = message.get("attachments", [])
-        message_text = message.get("text", "")
 
         for attachment in attachments:
             if attachment.get("type") == "image":
