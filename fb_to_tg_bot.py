@@ -5,7 +5,7 @@ Facebook Messenger → Telegram Forwarder Bot
 Workflow:
 1. User sends slip image to FB Page
 2. Bot stores the slip (does NOT forward yet)
-3. Page Admin reacts (like/love/etc) to the message
+3. Page Admin sends a message CONTAINING "done" (or other keywords) to approve
 4. Bot forwards slip to correct TG group (kyat/baht)
 5. Bot replies to FB user: "✅ ပြေစာရပါပြီ။ ⏳ ယူနစ်ဖြည့်ပေးနေပါပြီ၊ ခဏစောင့်ပါ။ 🙏 ကျေးဇူးတင်ပါတယ်ခင်ဗျာ။"
 
@@ -228,11 +228,28 @@ def send_telegram_photo(chat_id: str, photo_bytes: bytes, caption: str) -> int:
 
 
 # =============================================================================
+# Admin approval keywords
+# =============================================================================
+
+ADMIN_APPROVE_KEYWORDS = ["ok", "done", "✅", "okay", "yes", "approve", "ပြီး", "ပြီ", "ရပြီ"]
+
+
+def contains_approve_keyword(text: str) -> bool:
+    """Check if message CONTAINS any approval keyword (case-insensitive substring match).
+    This allows messages like 'done already' or 'ok done' to trigger approval.
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(kw.lower() in text_lower for kw in ADMIN_APPROVE_KEYWORDS)
+
+
+# =============================================================================
 # Main logic
 # =============================================================================
 
 def store_pending_slip(message_id: str, image_url: str, sender_profile: dict, caption_text: str, sender_id: str):
-    """Download image and store slip pending admin reaction"""
+    """Download image and store slip pending admin approval"""
     image_bytes = download_fb_image(image_url)
     if not image_bytes:
         logger.error("Image download failed - cannot store slip")
@@ -267,12 +284,12 @@ def store_pending_slip(message_id: str, image_url: str, sender_profile: dict, ca
         "currency": currency,
         "timestamp": now_str,
     }
-    logger.info(f"Slip stored pending admin reaction, msg_id={message_id}, currency={currency}, target={target_group}")
+    logger.info(f"Slip stored pending admin approval, msg_id={message_id}, currency={currency}, target={target_group}")
     return True
 
 
 def forward_pending_slip(message_id: str):
-    """Forward a stored slip to TG after admin reaction"""
+    """Forward a stored slip to TG after admin approval"""
     slip = pending_slips.pop(message_id, None)
     if not slip:
         logger.warning(f"No pending slip found for msg_id={message_id}")
@@ -359,10 +376,6 @@ def process_change_event(change: dict):
         logger.error(f"Change event error: {e}")
 
 
-# Keywords that admin sends to approve a slip
-ADMIN_APPROVE_KEYWORDS = ["ok", "done", "✅", "okay", "yes", "approve", "ပြီး", "ပြီ", "ရပြီ"]
-
-
 def process_messaging_event(event: dict):
     try:
         sender_id = event.get("sender", {}).get("id", "")
@@ -376,11 +389,14 @@ def process_messaging_event(event: dict):
         message_text = (message.get("text") or "").strip()
         attachments = message.get("attachments", [])
 
+        logger.info(f"Event: sender={sender_id}, recipient={recipient_id}, text='{message_text[:50]}', attachments={len(attachments)}")
+
         # --- Handle admin approval message ---
-        # Admin sends from Page (sender_id == FB_PAGE_ID) to a user
-        # The recipient is the user whose slip is pending
+        # Admin sends from Page inbox: sender_id == FB_PAGE_ID
+        # Check if message CONTAINS an approval keyword (substring match)
+        # e.g. "done", "ok done", "done already", "ပြီးပြီ" all work
         if sender_id == FB_PAGE_ID:
-            if message_text.lower() in ADMIN_APPROVE_KEYWORDS or message_text in ADMIN_APPROVE_KEYWORDS:
+            if contains_approve_keyword(message_text):
                 # recipient_id is the user the admin is replying to
                 logger.info(f"Admin approval message '{message_text}' to user {recipient_id}")
                 # Find pending slip for this recipient
@@ -389,11 +405,17 @@ def process_messaging_event(event: dict):
                     if slip.get("sender_id") == recipient_id:
                         matched_key = key
                         break
+                # If not found by recipient, use the latest pending slip
+                if not matched_key and pending_slips:
+                    matched_key = next(iter(pending_slips))
+                    logger.info(f"No slip for user {recipient_id}, using latest pending slip {matched_key}")
                 if matched_key:
-                    logger.info(f"Found pending slip {matched_key} for user {recipient_id} - forwarding")
+                    logger.info(f"Found pending slip {matched_key} - forwarding")
                     forward_pending_slip(matched_key)
                 else:
-                    logger.info(f"No pending slip for user {recipient_id}, pending: {list(pending_slips.keys())}")
+                    logger.info(f"No pending slips found, pending: {list(pending_slips.keys())}")
+            else:
+                logger.info(f"Admin message '{message_text}' does not contain approval keyword - ignoring")
             return
 
         # --- Handle incoming message from user ---
