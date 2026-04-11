@@ -1,553 +1,567 @@
 #!/usr/bin/env python3
 """
-Thai Baht Payment Slip Tracking Telegram Bot
-Monitors group messages, tracks payment slips, detects duplicates, and provides reporting.
-All responses in Myanmar language (Burmese).
-Text-based slip detection only (no OCR/image processing).
-Compatible with python-telegram-bot 13.x (Updater API)
+Thai Baht payment slip tracking bot for Telegram.
+
+Features
+- Tracks text-based and image-based slip submissions.
+- Uses Vision API when available for screenshot parsing.
+- Stores records in SQLite.
+- Detects duplicate transaction references.
+- Uses environment variables instead of hard-coded secrets.
 """
 
-import os
-import sqlite3
+from __future__ import annotations
+
+import base64
+import hashlib
+import io
+import json
 import logging
+import os
 import re
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 try:
-    # Try importing from newer versions first
-    from telegram import Update
-    from telegram.ext import Updater, CommandHandler, MessageHandler, filters
-    USE_FILTERS = True
-    FILTERS_MODULE = filters
-except ImportError:
-    # Fall back to older version imports
-    from telegram import Update
-    from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
-    USE_FILTERS = False
-    FILTERS_MODULE = Filters
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None
 
-from telegram.error import TelegramError
+try:
+    from telegram import Update
+    from telegram.ext import CallbackContext, CommandHandler, Filters, MessageHandler, Updater
+except ImportError:  # pragma: no cover
+    from telegram import Update
+    from telegram.ext import CommandHandler, MessageHandler, Updater, filters as Filters
+    CallbackContext = object
 
-# Configure logging
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO"),
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tg_slip_bot")
 
-# Myanmar language strings
+
+@dataclass(frozen=True)
+class Config:
+    token: str = os.environ.get("TG_BOT_TOKEN", "").strip()
+    special_user: str = os.environ.get("TG_SPECIAL_USER", "").strip().lstrip("@")
+    db_path: str = os.environ.get("SLIP_DB_PATH", os.path.join(DATA_DIR, "slip_records.db")).strip()
+    openai_model: str = os.environ.get("OPENAI_VISION_MODEL", "gpt-4.1-mini").strip()
+
+
+CONFIG = Config()
+
 MYANMAR_STRINGS = {
-    'welcome': 'ကြိုဆိုပါသည်။ ငွေလွှဲမှတ်တမ်းစနစ်သို့',
-    'help_title': '📋 အကူအညီ - အမိန့်များ',
-    'help_text': '''
-/summary - ယနေ့၏အကျဉ်းချုပ်ပြသ (စုစုပေါင်းအဝင်၊ စုစုပေါင်းအထုတ်၊ လက်ကျန်)
-/list [YYYY-MM-DD] - သတ်မှတ်ထားသောနေ့ရက်အတွက်ငွေလွှဲများစာရင်း (ပုံသဏ္ဍာန်: YYYY-MM-DD)
-/check [slip_id] - အတည်းအလျှင်း ID ရှိမရှိ စစ်ဆေးရန်
-/balance - လက်ကျန်ငွေပြသ
-/help - အကူအညီပြသ
-''',
-    'summary_header': '📊 ယနေ့၏အကျဉ်းချုပ်',
-    'summary_in': '✅ စုစုပေါင်းအဝင်: {amount} ဘတ်',
-    'summary_out': '❌ စုစုပေါင်းအထုတ်: {amount} ဘတ်',
-    'summary_balance': '💰 လက်ကျန်: {amount} ဘတ်',
-    'list_header': '📝 {date} အတွက်ငွေလွှဲများ',
-    'list_empty': 'ဤနေ့ရက်တွင်ငွေလွှဲမှတ်တမ်းမရှိပါ။',
-    'list_item': '{time} | {type} | {amount} ဘတ် | ID: {slip_id} | အသုံးပြုသူ: {username}',
-    'check_found': '✅ အတည်းအလျှင်း ID {slip_id} ရှိပါသည်။\nအချက်အလက်: {details}',
-    'check_not_found': '❌ အတည်းအလျှင်း ID {slip_id} မတွေ့ရှိပါ။',
-    'balance_current': '💰 လက်ကျန်ငွေ: {amount} ဘတ်',
-    'duplicate_alert': '⚠️ အသိ警告: အတည်းအလျှင်း ID {slip_id} အလယ်တွင်ရှိပြီးဖြစ်သည်။\nအရင်းအမြစ်: {previous_user} ({previous_time})',
-    'invalid_slip_alert': '⚠️ အသိ: အတည်းအလျှင်းအချက်အလက်သည်မှားမှားအားအားဖြစ်နိုင်သည်။ ကျေးဇူးပြု၍ အတည်းအလျှင်းကိုအတည်ပြုပါ။',
-    'slip_recorded': '✅ အတည်းအလျှင်း မှတ်တမ်းတင်ပြီးပါပြီ။\nID: {slip_id}\nအခြေအနေ: {type}\nအရေအတွက်: {amount} ဘတ်',
-    'error_invalid_date': '❌ အမှားအယွင်း: နေ့ရက်ပုံစံမှားသည်။ YYYY-MM-DD ကိုအသုံးပြုပါ။',
-    'error_invalid_slip_id': '❌ အမှားအယွင်း: အတည်းအလျှင်း ID မရှိပါ။',
-    'error_processing': '❌ အမှားအယွင်း: အချက်အလက်ကိုလုပ်ဆောင်နိုင်ခြင်းမရှိ။ ကျေးဇူးပြု၍ နောက်ပိုင်းတွင်ထပ်မံကြိုးစားပါ။',
-    'invalid_amount': '❌ အမှားအယွင်း: ငွေပမာဏမှားသည်။ ကျေးဇူးပြု၍ အရေအတွက်ကိုအတည်ပြုပါ။',
-    'incoming': 'အဝင်',
-    'outgoing': 'အထုတ်',
+    "welcome": "ကြိုဆိုပါသည်။ Thai Baht ငွေလွှဲမှတ်တမ်းစနစ်ဖြစ်ပါသည်။",
+    "help_title": "အမိန့်များ",
+    "help_text": (
+        "/summary - ယနေ့ အကျဉ်းချုပ်\n"
+        "/list [YYYY-MM-DD] - နေ့အလိုက်စာရင်း\n"
+        "/check [slip_id] - Ref/Slip ID စစ်ရန်\n"
+        "/balance - စုစုပေါင်းလက်ကျန်\n"
+        "/help - အကူအညီ"
+    ),
+    "summary_header": "ယနေ့၏ အကျဉ်းချုပ်",
+    "summary_in": "စုစုပေါင်းအဝင်: {amount} ဘတ်",
+    "summary_out": "စုစုပေါင်းအထုတ်: {amount} ဘတ်",
+    "summary_balance": "လက်ကျန်: {amount} ဘတ်",
+    "list_header": "{date} အတွက် ငွေလွှဲစာရင်း",
+    "list_empty": "ဤနေ့တွင် မှတ်တမ်းမရှိပါ။",
+    "list_item": "{time} | {type} | {amount} ဘတ် | ID: {slip_id} | {username}",
+    "check_found": "တွေ့ရှိပါသည်။\n{details}",
+    "check_not_found": "မတွေ့ရှိပါ။ ID: {slip_id}",
+    "balance_current": "လက်ကျန်ငွေ: {amount} ဘတ်",
+    "duplicate_alert": "Duplicate slip တွေ့ရှိပါသည်။\nID: {slip_id}\nယခင်အသုံးပြုသူ: {previous_user}\nယခင်အချိန်: {previous_time}",
+    "invalid_slip_alert": "Slip အချက်အလက် မပြည့်စုံပါ။ Ref ID သို့မဟုတ် amount ကို ထပ်စစ်ပေးပါ။",
+    "slip_recorded": "မှတ်တမ်းတင်ပြီးပါပြီ။\nID: {slip_id}\nအမျိုးအစား: {type}\nငွေပမာဏ: {amount} ဘတ်",
+    "error_invalid_date": "နေ့စွဲ format မှားနေပါတယ်။ YYYY-MM-DD အသုံးပြုပါ။",
+    "error_invalid_slip_id": "Slip ID / Ref ကို ထည့်ပေးပါ။",
+    "error_processing": "လုပ်ဆောင်မှု မအောင်မြင်ပါ။ နောက်တစ်ကြိမ် ထပ်စမ်းပေးပါ။",
+    "incoming": "အဝင်",
+    "outgoing": "အထုတ်",
 }
 
+
 class SlipDatabase:
-    """Database handler for payment slip records"""
-    
-    def __init__(self, db_path: str = '/tmp/slip_records.db'):
+    def __init__(self, db_path: str):
         self.db_path = db_path
         self.init_db()
-    
-    def init_db(self):
-        """Initialize database schema"""
+
+    def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Create transactions table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slip_id TEXT UNIQUE NOT NULL,
-                timestamp DATETIME NOT NULL,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                amount REAL NOT NULL,
-                transaction_type TEXT NOT NULL,
-                notes TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def init_db(self) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slip_id TEXT UNIQUE NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    amount REAL NOT NULL,
+                    transaction_type TEXT NOT NULL,
+                    notes TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-        ''')
-        
-        # Create duplicate alerts table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS duplicate_alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slip_id TEXT NOT NULL,
-                first_user_id INTEGER,
-                first_username TEXT,
-                first_timestamp DATETIME,
-                duplicate_user_id INTEGER,
-                duplicate_username TEXT,
-                duplicate_timestamp DATETIME,
-                alert_time DATETIME DEFAULT CURRENT_TIMESTAMP
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS duplicate_alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slip_id TEXT NOT NULL,
+                    first_user_id INTEGER,
+                    first_username TEXT,
+                    first_timestamp TEXT,
+                    duplicate_user_id INTEGER,
+                    duplicate_username TEXT,
+                    duplicate_timestamp TEXT,
+                    alert_time TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
             )
-        ''')
-        
-        # Create suspicious slips table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS suspicious_slips (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slip_id TEXT,
-                user_id INTEGER,
-                username TEXT,
-                reason TEXT,
-                timestamp DATETIME,
-                alert_time DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info(f"Database initialized at {self.db_path}")
-    
-    def add_transaction(self, slip_id: str, user_id: int, username: str, 
-                       amount: float, transaction_type: str, notes: str = '') -> Tuple[bool, str]:
-        """Add a new transaction record"""
+
+    def add_transaction(
+        self,
+        slip_id: str,
+        user_id: int,
+        username: str,
+        amount: float,
+        transaction_type: str,
+        notes: str = "",
+    ) -> Tuple[bool, str]:
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Check for duplicate slip ID
-            cursor.execute('SELECT * FROM transactions WHERE slip_id = ?', (slip_id,))
-            existing = cursor.fetchone()
-            
-            if existing:
-                # Record duplicate alert
-                cursor.execute('''
-                    INSERT INTO duplicate_alerts 
-                    (slip_id, first_user_id, first_username, first_timestamp, 
-                     duplicate_user_id, duplicate_username, duplicate_timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (slip_id, existing[2], existing[3], existing[1], 
-                      user_id, username, datetime.now()))
-                conn.commit()
-                conn.close()
-                return False, f"duplicate:{slip_id}:{existing[3]}:{existing[1]}"
-            
-            # Insert new transaction
-            cursor.execute('''
-                INSERT INTO transactions 
-                (slip_id, timestamp, user_id, username, amount, transaction_type, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (slip_id, datetime.now(), user_id, username, amount, transaction_type, notes))
-            
-            conn.commit()
-            conn.close()
+            with self.connect() as conn:
+                existing = conn.execute(
+                    "SELECT slip_id, timestamp, username, user_id FROM transactions WHERE slip_id = ?",
+                    (slip_id,),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        INSERT INTO duplicate_alerts (
+                            slip_id, first_user_id, first_username, first_timestamp,
+                            duplicate_user_id, duplicate_username, duplicate_timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            slip_id,
+                            existing[3],
+                            existing[2],
+                            existing[1],
+                            user_id,
+                            username,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        ),
+                    )
+                    return False, f"duplicate:{slip_id}:{existing[2]}:{existing[1]}"
+
+                conn.execute(
+                    """
+                    INSERT INTO transactions (
+                        slip_id, timestamp, user_id, username, amount, transaction_type, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        slip_id,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        user_id,
+                        username,
+                        amount,
+                        transaction_type,
+                        notes,
+                    ),
+                )
             return True, slip_id
-        except sqlite3.IntegrityError as e:
-            logger.error(f"Database integrity error: {e}")
-            return False, f"error:{str(e)}"
-        except Exception as e:
-            logger.error(f"Error adding transaction: {e}")
-            return False, f"error:{str(e)}"
-    
+        except Exception as exc:
+            logger.exception("Error adding transaction: %s", exc)
+            return False, f"error:{exc}"
+
     def get_today_summary(self) -> Dict[str, float]:
-        """Get today's transaction summary"""
+        today = datetime.now().strftime("%Y-%m-%d")
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            today = datetime.now().date()
-            
-            # Get incoming total
-            cursor.execute('''
-                SELECT SUM(amount) FROM transactions 
-                WHERE DATE(timestamp) = ? AND transaction_type = ?
-            ''', (today, 'အဝင်'))
-            incoming = cursor.fetchone()[0] or 0
-            
-            # Get outgoing total
-            cursor.execute('''
-                SELECT SUM(amount) FROM transactions 
-                WHERE DATE(timestamp) = ? AND transaction_type = ?
-            ''', (today, 'အထုတ်'))
-            outgoing = cursor.fetchone()[0] or 0
-            
-            conn.close()
-            return {
-                'incoming': incoming,
-                'outgoing': outgoing,
-                'balance': incoming - outgoing
-            }
-        except Exception as e:
-            logger.error(f"Error getting summary: {e}")
-            return {'incoming': 0, 'outgoing': 0, 'balance': 0}
-    
-    def get_transactions_by_date(self, date_str: str) -> List[Dict]:
-        """Get all transactions for a specific date"""
+            with self.connect() as conn:
+                incoming = conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE DATE(timestamp) = ? AND transaction_type = ?",
+                    (today, MYANMAR_STRINGS["incoming"]),
+                ).fetchone()[0]
+                outgoing = conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE DATE(timestamp) = ? AND transaction_type = ?",
+                    (today, MYANMAR_STRINGS["outgoing"]),
+                ).fetchone()[0]
+            return {"incoming": incoming, "outgoing": outgoing, "balance": incoming - outgoing}
+        except Exception as exc:
+            logger.exception("Error getting summary: %s", exc)
+            return {"incoming": 0.0, "outgoing": 0.0, "balance": 0.0}
+
+    def get_transactions_by_date(self, date_str: str) -> List[Dict[str, str]]:
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT slip_id, timestamp, username, amount, transaction_type 
-                FROM transactions 
-                WHERE DATE(timestamp) = ?
-                ORDER BY timestamp DESC
-            ''', (date_str,))
-            
-            results = []
-            for row in cursor.fetchall():
-                results.append({
-                    'slip_id': row[0],
-                    'timestamp': row[1],
-                    'username': row[2],
-                    'amount': row[3],
-                    'type': row[4]
-                })
-            
-            conn.close()
-            return results
-        except Exception as e:
-            logger.error(f"Error getting transactions: {e}")
+            with self.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT slip_id, timestamp, username, amount, transaction_type
+                    FROM transactions WHERE DATE(timestamp) = ? ORDER BY timestamp DESC
+                    """,
+                    (date_str,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as exc:
+            logger.exception("Error getting transactions: %s", exc)
             return []
-    
-    def check_slip_id(self, slip_id: str) -> Optional[Dict]:
-        """Check if a slip ID exists"""
+
+    def check_slip_id(self, slip_id: str) -> Optional[Dict[str, str]]:
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                SELECT slip_id, timestamp, username, amount, transaction_type 
-                FROM transactions 
-                WHERE slip_id = ?
-            ''', (slip_id,))
-            
-            result = cursor.fetchone()
-            conn.close()
-            
-            if result:
-                return {
-                    'slip_id': result[0],
-                    'timestamp': result[1],
-                    'username': result[2],
-                    'amount': result[3],
-                    'type': result[4]
-                }
+            with self.connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT slip_id, timestamp, username, amount, transaction_type, notes
+                    FROM transactions WHERE slip_id = ?
+                    """,
+                    (slip_id,),
+                ).fetchone()
+            return dict(row) if row else None
+        except Exception as exc:
+            logger.exception("Error checking slip id: %s", exc)
             return None
-        except Exception as e:
-            logger.error(f"Error checking slip ID: {e}")
-            return None
-    
+
     def get_total_balance(self) -> float:
-        """Get total balance across all time"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Get total incoming
-            cursor.execute('''
-                SELECT SUM(amount) FROM transactions WHERE transaction_type = ?
-            ''', ('အဝင်',))
-            incoming = cursor.fetchone()[0] or 0
-            
-            # Get total outgoing
-            cursor.execute('''
-                SELECT SUM(amount) FROM transactions WHERE transaction_type = ?
-            ''', ('အထုတ်',))
-            outgoing = cursor.fetchone()[0] or 0
-            
-            conn.close()
-            return incoming - outgoing
-        except Exception as e:
-            logger.error(f"Error getting balance: {e}")
-            return 0
+            with self.connect() as conn:
+                incoming = conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE transaction_type = ?",
+                    (MYANMAR_STRINGS["incoming"],),
+                ).fetchone()[0]
+                outgoing = conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE transaction_type = ?",
+                    (MYANMAR_STRINGS["outgoing"],),
+                ).fetchone()[0]
+            return float(incoming) - float(outgoing)
+        except Exception as exc:
+            logger.exception("Error getting total balance: %s", exc)
+            return 0.0
 
 
 class SlipDetector:
-    """Detect and extract payment slip information from text"""
-    
-    # Thai Baht slip ID patterns
     SLIP_ID_PATTERNS = [
-        r'(?:slip|id|no\.?|#)\s*:?\s*([A-Z0-9]{6,20})',  # Explicit slip ID
-        r'([A-Z0-9]{8,16})',  # Generic alphanumeric ID
+        r"(?:slip|ref|reference|id|no\.?|#)\s*:?\s*([A-Z0-9\-]{6,40})",
+        r"([A-Z0-9]{8,25})",
     ]
-    
-    # Amount patterns (Thai Baht)
     AMOUNT_PATTERNS = [
-        r'(?:amount|total|sum|baht|บาท)\s*:?\s*([0-9]+(?:[.,][0-9]{2})?)',
-        r'([0-9]+(?:[.,][0-9]{2})?)\s*(?:baht|บาท|฿)',
-        r'(?:฿|baht)\s*([0-9]+(?:[.,][0-9]{2})?)',
+        r"(?:amount|total|sum|baht|บาท|THB)\s*:?\s*([0-9]+(?:[.,][0-9]{1,2})?)",
+        r"([0-9]+(?:[.,][0-9]{1,2})?)\s*(?:baht|บาท|฿|THB)",
+        r"(?:฿|THB)\s*([0-9]+(?:[.,][0-9]{1,2})?)",
     ]
-    
+
     @staticmethod
     def extract_from_text(text: str) -> Tuple[Optional[str], Optional[float]]:
-        """Extract slip ID and amount from text"""
+        if not text:
+            return None, None
+
         slip_id = None
         amount = None
-        
-        text_upper = text.upper()
-        
-        # Try to extract slip ID
+        upper_text = text.upper()
+
         for pattern in SlipDetector.SLIP_ID_PATTERNS:
-            match = re.search(pattern, text_upper, re.IGNORECASE)
+            match = re.search(pattern, upper_text, re.IGNORECASE)
             if match:
-                slip_id = match.group(1).strip()
-                if len(slip_id) >= 6:  # Minimum length for valid slip ID
+                candidate = match.group(1).strip()
+                if 6 <= len(candidate) <= 40:
+                    slip_id = candidate
                     break
-        
-        # Try to extract amount
+
         for pattern in SlipDetector.AMOUNT_PATTERNS:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                amount_str = match.group(1).replace(',', '.')
+                raw = match.group(1).replace(",", "")
                 try:
-                    amount = float(amount_str)
-                    if 0 < amount < 1000000:  # Reasonable amount range
+                    value = float(raw)
+                    if 0 < value < 10000000:
+                        amount = value
                         break
                 except ValueError:
                     continue
-        
+
         return slip_id, amount
-    
+
     @staticmethod
     def is_valid_slip(slip_id: Optional[str], amount: Optional[float]) -> bool:
-        """Validate slip information"""
-        if not slip_id or not amount:
-            return False
-        
-        # Validate slip ID format
-        if not (6 <= len(slip_id) <= 20):
-            return False
-        
-        # Validate amount
-        if not (0 < amount < 1000000):
-            return False
-        
-        return True
+        return bool(slip_id) and amount is not None and 0 < amount < 10000000
+
+
+class VisionSlipAnalyzer:
+    def __init__(self, model: str):
+        self.model = model
+        self.client = OpenAI() if OpenAI is not None and os.environ.get("OPENAI_API_KEY") else None
+
+    def analyze(self, image_bytes: bytes, message_text: str = "") -> Dict[str, str]:
+        if self.client is None:
+            return {
+                "bank_name": "",
+                "amount": "",
+                "reference_id": self.fallback_image_id(image_bytes),
+                "sender_name": "",
+                "receiver_name": "",
+                "transfer_datetime": "",
+                "raw_summary": "Vision API not configured.",
+            }
+
+        try:
+            encoded = base64.b64encode(image_bytes).decode("utf-8")
+            prompt = (
+                "Read this Thai bank transfer screenshot and return JSON only with keys: "
+                "bank_name, amount, reference_id, sender_name, receiver_name, transfer_datetime, raw_summary. "
+                "If a field is unclear, return an empty string. Context text: "
+                f"{message_text or 'none'}"
+            )
+            response = self.client.chat.completions.create(
+                model=self.model,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": "You extract SCB and Thai transfer slip data into strict JSON."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}},
+                        ],
+                    },
+                ],
+                max_tokens=400,
+                timeout=45,
+            )
+            content = response.choices[0].message.content or "{}"
+            parsed = json.loads(content)
+            ref = str(parsed.get("reference_id", "")).strip() or self.fallback_image_id(image_bytes)
+            return {
+                "bank_name": str(parsed.get("bank_name", "")).strip(),
+                "amount": str(parsed.get("amount", "")).strip(),
+                "reference_id": ref,
+                "sender_name": str(parsed.get("sender_name", "")).strip(),
+                "receiver_name": str(parsed.get("receiver_name", "")).strip(),
+                "transfer_datetime": str(parsed.get("transfer_datetime", "")).strip(),
+                "raw_summary": str(parsed.get("raw_summary", "")).strip(),
+            }
+        except Exception as exc:
+            logger.warning("Vision analysis failed: %s", exc)
+            return {
+                "bank_name": "",
+                "amount": "",
+                "reference_id": self.fallback_image_id(image_bytes),
+                "sender_name": "",
+                "receiver_name": "",
+                "transfer_datetime": "",
+                "raw_summary": f"Vision analysis failed: {exc}",
+            }
+
+    @staticmethod
+    def fallback_image_id(image_bytes: bytes) -> str:
+        return "IMG-" + hashlib.sha1(image_bytes).hexdigest()[:12].upper()
 
 
 class TelegramSlipBot:
-    """Main Telegram bot handler using Updater API"""
-    
-    def __init__(self, token: str, special_user: str):
-        self.token = token
-        self.special_user = special_user
-        self.db = SlipDatabase()
+    def __init__(self, config: Config):
+        self.config = config
+        self.db = SlipDatabase(config.db_path)
         self.detector = SlipDetector()
-    
-    def start(self, update: Update, context):
-        """Handle /start command"""
-        update.message.reply_text(
-            f"{MYANMAR_STRINGS['welcome']}\n\n{MYANMAR_STRINGS['help_text']}"
+        self.vision = VisionSlipAnalyzer(config.openai_model)
+
+    def _transaction_type(self, username: str) -> str:
+        normalized = (username or "").lstrip("@")
+        if self.config.special_user and normalized == self.config.special_user:
+            return MYANMAR_STRINGS["outgoing"]
+        return MYANMAR_STRINGS["incoming"]
+
+    def start(self, update: Update, context: CallbackContext) -> None:
+        update.message.reply_text(f"{MYANMAR_STRINGS['welcome']}\n\n{MYANMAR_STRINGS['help_text']}")
+
+    def help_command(self, update: Update, context: CallbackContext) -> None:
+        update.message.reply_text(f"{MYANMAR_STRINGS['help_title']}\n\n{MYANMAR_STRINGS['help_text']}")
+
+    def summary_command(self, update: Update, context: CallbackContext) -> None:
+        summary = self.db.get_today_summary()
+        text = (
+            f"{MYANMAR_STRINGS['summary_header']}\n\n"
+            f"{MYANMAR_STRINGS['summary_in'].format(amount=summary['incoming'])}\n"
+            f"{MYANMAR_STRINGS['summary_out'].format(amount=summary['outgoing'])}\n"
+            f"{MYANMAR_STRINGS['summary_balance'].format(amount=summary['balance'])}"
         )
-    
-    def help_command(self, update: Update, context):
-        """Handle /help command"""
-        help_text = f"{MYANMAR_STRINGS['help_title']}\n{MYANMAR_STRINGS['help_text']}"
-        update.message.reply_text(help_text)
-    
-    def summary_command(self, update: Update, context):
-        """Handle /summary command"""
-        try:
-            summary = self.db.get_today_summary()
-            
-            response = f"{MYANMAR_STRINGS['summary_header']}\n\n"
-            response += f"{MYANMAR_STRINGS['summary_in'].format(amount=summary['incoming'])}\n"
-            response += f"{MYANMAR_STRINGS['summary_out'].format(amount=summary['outgoing'])}\n"
-            response += f"{MYANMAR_STRINGS['summary_balance'].format(amount=summary['balance'])}"
-            
-            update.message.reply_text(response)
-        except Exception as e:
-            logger.error(f"Error in summary command: {e}")
-            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
-    
-    def list_command(self, update: Update, context):
-        """Handle /list command"""
-        try:
-            # Get date from arguments or use today
-            if context.args:
-                date_str = context.args[0]
-                # Validate date format
-                try:
-                    datetime.strptime(date_str, '%Y-%m-%d')
-                except ValueError:
-                    update.message.reply_text(MYANMAR_STRINGS['error_invalid_date'])
-                    return
-            else:
-                date_str = datetime.now().strftime('%Y-%m-%d')
-            
-            transactions = self.db.get_transactions_by_date(date_str)
-            
-            if not transactions:
-                response = f"{MYANMAR_STRINGS['list_header'].format(date=date_str)}\n\n"
-                response += MYANMAR_STRINGS['list_empty']
-            else:
-                response = f"{MYANMAR_STRINGS['list_header'].format(date=date_str)}\n\n"
-                for tx in transactions:
-                    time_str = tx['timestamp'].split(' ')[1] if ' ' in tx['timestamp'] else tx['timestamp']
-                    item_str = MYANMAR_STRINGS['list_item'].format(
-                        time=time_str,
-                        type=tx['type'],
-                        amount=tx['amount'],
-                        slip_id=tx['slip_id'],
-                        username=tx['username'] or 'Unknown'
-                    )
-                    response += f"{item_str}\n"
-            
-            update.message.reply_text(response)
-        except Exception as e:
-            logger.error(f"Error in list command: {e}")
-            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
-    
-    def check_command(self, update: Update, context):
-        """Handle /check command"""
-        try:
-            if not context.args:
-                update.message.reply_text(MYANMAR_STRINGS['error_invalid_slip_id'])
+        update.message.reply_text(text)
+
+    def list_command(self, update: Update, context: CallbackContext) -> None:
+        if context.args:
+            date_str = context.args[0]
+            try:
+                datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                update.message.reply_text(MYANMAR_STRINGS["error_invalid_date"])
                 return
-            
-            slip_id = context.args[0]
-            result = self.db.check_slip_id(slip_id)
-            
-            if result:
-                details = f"{result['type']} | {result['amount']} ဘတ် | {result['username']} | {result['timestamp']}"
-                response = MYANMAR_STRINGS['check_found'].format(slip_id=slip_id, details=details)
-            else:
-                response = MYANMAR_STRINGS['check_not_found'].format(slip_id=slip_id)
-            
-            update.message.reply_text(response)
-        except Exception as e:
-            logger.error(f"Error in check command: {e}")
-            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
-    
-    def balance_command(self, update: Update, context):
-        """Handle /balance command"""
-        try:
-            balance = self.db.get_total_balance()
-            response = MYANMAR_STRINGS['balance_current'].format(amount=balance)
-            update.message.reply_text(response)
-        except Exception as e:
-            logger.error(f"Error in balance command: {e}")
-            update.message.reply_text(MYANMAR_STRINGS['error_processing'])
-    
-    def handle_message(self, update: Update, context):
-        """Handle incoming text messages with payment slip information"""
-        try:
-            if not update.message or not update.message.text:
-                return
-            
-            # Determine transaction type based on sender
-            sender_username = update.message.from_user.username or f"user_{update.message.from_user.id}"
-            is_special_user = sender_username == self.special_user or \
-                            (self.special_user.startswith('@') and sender_username == self.special_user[1:])
-            
-            transaction_type = MYANMAR_STRINGS['outgoing'] if is_special_user else MYANMAR_STRINGS['incoming']
-            
-            # Extract information from text message
-            slip_id, amount = self.detector.extract_from_text(update.message.text)
-            
-            # Validate and store if valid slip information found
-            if self.detector.is_valid_slip(slip_id, amount):
-                success, result = self.db.add_transaction(
-                    slip_id=slip_id,
-                    user_id=update.message.from_user.id,
-                    username=sender_username,
-                    amount=amount,
-                    transaction_type=transaction_type
+        else:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+
+        rows = self.db.get_transactions_by_date(date_str)
+        if not rows:
+            update.message.reply_text(f"{MYANMAR_STRINGS['list_header'].format(date=date_str)}\n\n{MYANMAR_STRINGS['list_empty']}")
+            return
+
+        lines = [MYANMAR_STRINGS["list_header"].format(date=date_str), ""]
+        for row in rows:
+            time_str = str(row["timestamp"]).split(" ")[-1]
+            lines.append(
+                MYANMAR_STRINGS["list_item"].format(
+                    time=time_str,
+                    type=row["transaction_type"],
+                    amount=row["amount"],
+                    slip_id=row["slip_id"],
+                    username=row["username"] or "Unknown",
                 )
-                
-                if success:
-                    response = MYANMAR_STRINGS['slip_recorded'].format(
-                        slip_id=slip_id,
-                        type=transaction_type,
-                        amount=amount
-                    )
-                    update.message.reply_text(response)
-                    logger.info(f"Recorded slip {slip_id} from {sender_username}")
-                elif result.startswith('duplicate:'):
-                    parts = result.split(':')
-                    dup_slip_id = parts[1]
-                    prev_user = parts[2]
-                    alert = MYANMAR_STRINGS['duplicate_alert'].format(
-                        slip_id=dup_slip_id,
-                        previous_user=prev_user,
-                        previous_time=parts[3] if len(parts) > 3 else 'Unknown'
-                    )
-                    update.message.reply_text(alert)
-                    logger.warning(f"Duplicate slip detected: {dup_slip_id}")
-            else:
-                # Only alert if message looks like it might be a slip
-                if slip_id or amount:
-                    update.message.reply_text(MYANMAR_STRINGS['invalid_slip_alert'])
-                    logger.warning(f"Invalid slip from {sender_username}: ID={slip_id}, Amount={amount}")
-        
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
-    
-    def run(self):
-        """Run the bot using Updater API"""
-        # Create the Updater and pass it your bot's token
-        updater = Updater(self.token, use_context=True)
-        
-        # Get the dispatcher to register handlers
+            )
+        update.message.reply_text("\n".join(lines))
+
+    def check_command(self, update: Update, context: CallbackContext) -> None:
+        if not context.args:
+            update.message.reply_text(MYANMAR_STRINGS["error_invalid_slip_id"])
+            return
+        slip_id = context.args[0]
+        record = self.db.check_slip_id(slip_id)
+        if not record:
+            update.message.reply_text(MYANMAR_STRINGS["check_not_found"].format(slip_id=slip_id))
+            return
+        details = (
+            f"အမျိုးအစား: {record['transaction_type']}\n"
+            f"ငွေပမာဏ: {record['amount']} ဘတ်\n"
+            f"အသုံးပြုသူ: {record['username']}\n"
+            f"အချိန်: {record['timestamp']}\n"
+            f"မှတ်ချက်: {record.get('notes') or '-'}"
+        )
+        update.message.reply_text(MYANMAR_STRINGS["check_found"].format(details=details))
+
+    def balance_command(self, update: Update, context: CallbackContext) -> None:
+        update.message.reply_text(MYANMAR_STRINGS["balance_current"].format(amount=self.db.get_total_balance()))
+
+    def extract_photo_bytes(self, update: Update) -> Optional[bytes]:
+        try:
+            message = update.message
+            if message.photo:
+                tg_file = message.photo[-1].get_file()
+                buffer = io.BytesIO()
+                tg_file.download(out=buffer)
+                return buffer.getvalue()
+            if message.document and (message.document.mime_type or "").startswith("image/"):
+                tg_file = message.document.get_file()
+                buffer = io.BytesIO()
+                tg_file.download(out=buffer)
+                return buffer.getvalue()
+        except Exception as exc:
+            logger.warning("Failed to download Telegram image: %s", exc)
+        return None
+
+    def handle_message(self, update: Update, context: CallbackContext) -> None:
+        message = update.message
+        if not message:
+            return
+
+        sender_username = message.from_user.username or f"user_{message.from_user.id}"
+        transaction_type = self._transaction_type(sender_username)
+        text = (message.caption or message.text or "").strip()
+
+        slip_id = None
+        amount = None
+        notes = []
+
+        if text:
+            slip_id, amount = self.detector.extract_from_text(text)
+
+        if (slip_id is None or amount is None) and (message.photo or message.document):
+            image_bytes = self.extract_photo_bytes(update)
+            if image_bytes:
+                vision = self.vision.analyze(image_bytes, text)
+                if not slip_id:
+                    slip_id = vision.get("reference_id")
+                if amount is None and vision.get("amount"):
+                    try:
+                        amount = float(str(vision["amount"]).replace(",", ""))
+                    except ValueError:
+                        amount = None
+                if vision.get("bank_name"):
+                    notes.append(f"bank={vision['bank_name']}")
+                if vision.get("sender_name"):
+                    notes.append(f"sender={vision['sender_name']}")
+                if vision.get("receiver_name"):
+                    notes.append(f"receiver={vision['receiver_name']}")
+                if vision.get("transfer_datetime"):
+                    notes.append(f"datetime={vision['transfer_datetime']}")
+                if vision.get("raw_summary"):
+                    notes.append(f"summary={vision['raw_summary']}")
+
+        if not self.detector.is_valid_slip(slip_id, amount):
+            if slip_id or amount or message.photo or message.document:
+                update.message.reply_text(MYANMAR_STRINGS["invalid_slip_alert"])
+            return
+
+        success, result = self.db.add_transaction(
+            slip_id=slip_id,
+            user_id=message.from_user.id,
+            username=sender_username,
+            amount=amount,
+            transaction_type=transaction_type,
+            notes=" | ".join(notes),
+        )
+        if success:
+            update.message.reply_text(
+                MYANMAR_STRINGS["slip_recorded"].format(
+                    slip_id=slip_id,
+                    type=transaction_type,
+                    amount=amount,
+                )
+            )
+            return
+
+        if result.startswith("duplicate:"):
+            _, dup_id, previous_user, previous_time = result.split(":", 3)
+            update.message.reply_text(
+                MYANMAR_STRINGS["duplicate_alert"].format(
+                    slip_id=dup_id,
+                    previous_user=previous_user,
+                    previous_time=previous_time,
+                )
+            )
+            return
+
+        update.message.reply_text(MYANMAR_STRINGS["error_processing"])
+
+    def run(self) -> None:
+        if not self.config.token:
+            raise RuntimeError("TG_BOT_TOKEN is required for tg_slip_bot.py")
+
+        updater = Updater(self.config.token, use_context=True)
         dispatcher = updater.dispatcher
-        
-        # Add command handlers
         dispatcher.add_handler(CommandHandler("start", self.start))
         dispatcher.add_handler(CommandHandler("help", self.help_command))
         dispatcher.add_handler(CommandHandler("summary", self.summary_command))
         dispatcher.add_handler(CommandHandler("list", self.list_command))
         dispatcher.add_handler(CommandHandler("check", self.check_command))
         dispatcher.add_handler(CommandHandler("balance", self.balance_command))
-        
-        # Add message handler for text messages only
-        if USE_FILTERS:
-            # For newer versions with filters module
-            dispatcher.add_handler(MessageHandler(FILTERS_MODULE.text & ~FILTERS_MODULE.command, self.handle_message))
-        else:
-            # For older versions with Filters class
-            dispatcher.add_handler(MessageHandler(FILTERS_MODULE.TEXT & ~FILTERS_MODULE.COMMAND, self.handle_message))
-        
-        logger.info("Bot started and polling...")
-        
-        # Start the Bot
-        updater.start_polling()
-        
-        # Run the bot until you press Ctrl-C or the process receives SIGINT, SIGTERM or SIGABRT
+        dispatcher.add_handler(MessageHandler(Filters.text | Filters.photo | Filters.document, self.handle_message))
+
+        logger.info("tg_slip_bot started. db=%s", self.config.db_path)
+        updater.start_polling(drop_pending_updates=True)
         updater.idle()
 
 
-def main():
-    """Main entry point"""
-    # Configuration
-    BOT_TOKEN = "8214915771:AAEuffebveqtWAQpFmeHE_SxjeqD7Foyxyw"
-    SPECIAL_USER = "Stttt298"  # Without @ symbol
-    
-    # Initialize and run bot
-    bot = TelegramSlipBot(
-        token=BOT_TOKEN,
-        special_user=SPECIAL_USER
-    )
-    
+def main() -> None:
+    bot = TelegramSlipBot(CONFIG)
     bot.run()
 
 
