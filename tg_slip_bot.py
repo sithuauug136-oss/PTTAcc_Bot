@@ -193,14 +193,16 @@ class SlipDatabase:
         today = datetime.now().strftime("%Y-%m-%d")
         try:
             with self.connect() as conn:
-                incoming = conn.execute(
+                row_in = conn.execute(
                     "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE DATE(timestamp) = ? AND transaction_type = ?",
                     (today, MYANMAR_STRINGS["incoming"]),
-                ).fetchone()[0]
-                outgoing = conn.execute(
+                ).fetchone()
+                incoming = row_in[0] if row_in else 0
+                row_out = conn.execute(
                     "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE DATE(timestamp) = ? AND transaction_type = ?",
                     (today, MYANMAR_STRINGS["outgoing"]),
-                ).fetchone()[0]
+                ).fetchone()
+                outgoing = row_out[0] if row_out else 0
             return {"incoming": incoming, "outgoing": outgoing, "balance": incoming - outgoing}
         except Exception as exc:
             logger.exception("Error getting summary: %s", exc)
@@ -239,14 +241,16 @@ class SlipDatabase:
     def get_total_balance(self) -> float:
         try:
             with self.connect() as conn:
-                incoming = conn.execute(
+                row_in = conn.execute(
                     "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE transaction_type = ?",
                     (MYANMAR_STRINGS["incoming"],),
-                ).fetchone()[0]
-                outgoing = conn.execute(
+                ).fetchone()
+                incoming = row_in[0] if row_in else 0
+                row_out = conn.execute(
                     "SELECT COALESCE(SUM(amount), 0) FROM transactions WHERE transaction_type = ?",
                     (MYANMAR_STRINGS["outgoing"],),
-                ).fetchone()[0]
+                ).fetchone()
+                outgoing = row_out[0] if row_out else 0
             return float(incoming) - float(outgoing)
         except Exception as exc:
             logger.exception("Error getting total balance: %s", exc)

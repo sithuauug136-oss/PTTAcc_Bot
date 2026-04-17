@@ -268,7 +268,9 @@ def verify_fb_signature(raw_body: bytes) -> bool:
         raw_body,
         hashlib.sha256,
     ).hexdigest()
-    provided = signature.split("=", 1)[1]
+    provided = signature[len("sha256="):]
+    if not provided:
+        return False
     return hmac.compare_digest(expected, provided)
 
 
