@@ -131,6 +131,22 @@ class PendingSlipStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS webhook_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_time TEXT NOT NULL,
+                    message_id TEXT,
+                    sender_id TEXT,
+                    recipient_id TEXT,
+                    is_page_message INTEGER NOT NULL,
+                    has_approval INTEGER NOT NULL,
+                    attachment_count INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    note TEXT
+                )
+                """
+            )
 
     def has_processed_message(self, message_id: str) -> bool:
         if not message_id:
@@ -210,11 +226,62 @@ class PendingSlipStore:
             row = conn.execute("SELECT COUNT(*) FROM pending_slips").fetchone()
         return int(row[0]) if row else 0
 
+    def record_webhook_event(
+        self,
+        message_id: str,
+        sender_id: str,
+        recipient_id: str,
+        is_page_message: bool,
+        has_approval: bool,
+        attachment_count: int,
+        action: str,
+        note: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO webhook_events (
+                    event_time, message_id, sender_id, recipient_id, is_page_message,
+                    has_approval, attachment_count, action, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.utcnow().isoformat() + "Z",
+                    message_id,
+                    sender_id,
+                    recipient_id,
+                    1 if is_page_message else 0,
+                    1 if has_approval else 0,
+                    int(attachment_count or 0),
+                    action[:80],
+                    note[:300],
+                ),
+            )
+            conn.execute(
+                "DELETE FROM webhook_events WHERE id NOT IN (SELECT id FROM webhook_events ORDER BY id DESC LIMIT 100)"
+            )
+
+    def recent_webhook_events(self, limit: int = 25) -> list[Dict[str, Any]]:
+        limit = max(1, min(int(limit or 25), 100))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_time, message_id, sender_id, recipient_id, is_page_message,
+                       has_approval, attachment_count, action, note
+                FROM webhook_events
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
 
 store = PendingSlipStore(CONFIG.db_path)
 app = Flask(__name__)
 http = requests.Session()
 reference_hash_cache: Optional[str] = None
+fb_page_self_cache: Optional[Dict[str, str]] = None
 
 
 BAHT_KEYWORDS = [
@@ -443,6 +510,62 @@ def analyze_slip_with_vision(image_bytes: bytes, message_text: str = "") -> Dict
         return fallback_result
 
 
+def get_fb_page_self() -> Dict[str, str]:
+    """Return the Page identity represented by FB_PAGE_ACCESS_TOKEN.
+
+    This is intentionally separate from FB_PAGE_ID because a mismatched
+    configured Page ID can make admin/page echo messages look like normal
+    customer messages, causing DONE approvals to be ignored.
+    """
+    global fb_page_self_cache
+    if fb_page_self_cache is not None:
+        return fb_page_self_cache
+
+    fb_page_self_cache = {"id": "", "name": ""}
+    if not CONFIG.fb_page_access_token:
+        return fb_page_self_cache
+
+    try:
+        resp = http.get(
+            f"{FB_GRAPH_API}/me",
+            params={"fields": "id,name", "access_token": CONFIG.fb_page_access_token},
+            timeout=CONFIG.request_timeout,
+        )
+        if resp.ok:
+            data = resp.json()
+            fb_page_self_cache = {
+                "id": str(data.get("id", "") or ""),
+                "name": str(data.get("name", "") or ""),
+            }
+            if CONFIG.fb_page_id and fb_page_self_cache["id"] and CONFIG.fb_page_id != fb_page_self_cache["id"]:
+                logger.warning(
+                    "Configured FB_PAGE_ID %s does not match page access token id %s; using both for admin detection",
+                    CONFIG.fb_page_id,
+                    fb_page_self_cache["id"],
+                )
+        else:
+            logger.warning("FB /me lookup failed: %s %s", resp.status_code, resp.text[:300])
+    except Exception as exc:
+        logger.warning("FB /me lookup error: %s", exc)
+    return fb_page_self_cache
+
+
+def get_known_page_ids() -> set[str]:
+    ids = set()
+    if CONFIG.fb_page_id:
+        ids.add(CONFIG.fb_page_id)
+    token_page_id = get_fb_page_self().get("id", "")
+    if token_page_id:
+        ids.add(token_page_id)
+    return ids
+
+
+def is_page_originated_event(event: Dict[str, Any]) -> bool:
+    message = event.get("message") or {}
+    sender_id = str(event.get("sender", {}).get("id", "") or "")
+    return bool(message.get("is_echo")) or sender_id in get_known_page_ids()
+
+
 def get_fb_user_profile(sender_id: str) -> Dict[str, str]:
     profile = {"id": sender_id, "name": "Unknown"}
     if not CONFIG.fb_page_access_token:
@@ -612,9 +735,17 @@ def forward_pending_slip(record: Dict[str, Any]) -> bool:
 
 
 def message_contains_approval(event: Dict[str, Any]) -> bool:
-    message = event.get("message", {})
-    text = (message.get("text") or "").strip()
-    if contains_approve_keyword(text):
+    message = event.get("message", {}) or {}
+    postback = event.get("postback", {}) or {}
+    quick_reply = message.get("quick_reply", {}) or {}
+    candidate_texts = [
+        message.get("text", ""),
+        quick_reply.get("payload", ""),
+        quick_reply.get("title", ""),
+        postback.get("title", ""),
+        postback.get("payload", ""),
+    ]
+    if any(contains_approve_keyword(str(text or "")) for text in candidate_texts):
         return True
 
     for attachment in message.get("attachments", []):
@@ -631,7 +762,12 @@ def process_messaging_event(event: Dict[str, Any]) -> None:
     sender_id = event.get("sender", {}).get("id", "")
     recipient_id = event.get("recipient", {}).get("id", "")
     message = event.get("message") or {}
-    message_id = str(message.get("mid", "") or event.get("timestamp", ""))
+    postback = event.get("postback") or {}
+    message_id = str(
+        message.get("mid", "")
+        or postback.get("mid", "")
+        or f"{event.get('timestamp', '')}:{sender_id}:{recipient_id}"
+    )
 
     if not message_id:
         logger.info("Skipping event without message id")
@@ -640,9 +776,15 @@ def process_messaging_event(event: Dict[str, Any]) -> None:
         logger.info("Skipping already-processed message %s", message_id)
         return
 
-    text = (message.get("text") or "").strip()
+    text = (
+        message.get("text")
+        or postback.get("title")
+        or postback.get("payload")
+        or ""
+    ).strip()
     attachments = message.get("attachments", [])
-    is_page_message = bool(message.get("is_echo")) or (CONFIG.fb_page_id and sender_id == CONFIG.fb_page_id)
+    is_page_message = is_page_originated_event(event)
+    has_approval = message_contains_approval(event) if is_page_message else False
 
     logger.info(
         "Processing message_id=%s sender=%s recipient=%s is_page_message=%s attachments=%s text=%r",
@@ -655,7 +797,7 @@ def process_messaging_event(event: Dict[str, Any]) -> None:
     )
 
     if is_page_message:
-        if message_contains_approval(event):
+        if has_approval:
             pending = None
             if recipient_id:
                 pending = store.get_latest_for_user(recipient_id)
@@ -664,16 +806,21 @@ def process_messaging_event(event: Dict[str, Any]) -> None:
             if pending:
                 if forward_pending_slip(pending):
                     logger.info("Forwarded pending slip %s after admin approval", pending["message_id"])
+                    store.record_webhook_event(message_id, sender_id, recipient_id, is_page_message, has_approval, len(attachments), "forwarded", pending["message_id"])
                 else:
                     logger.warning("Failed to forward pending slip %s", pending["message_id"])
+                    store.record_webhook_event(message_id, sender_id, recipient_id, is_page_message, has_approval, len(attachments), "forward_failed", pending["message_id"])
             else:
                 logger.info("Approval detected but no pending slip was available")
+                store.record_webhook_event(message_id, sender_id, recipient_id, is_page_message, has_approval, len(attachments), "approval_no_pending")
         else:
             logger.info("Page/admin message did not match approval rule")
+            store.record_webhook_event(message_id, sender_id, recipient_id, is_page_message, has_approval, len(attachments), "page_non_approval")
         store.mark_processed_message(message_id)
         return
 
     if not attachments:
+        store.record_webhook_event(message_id, sender_id, recipient_id, is_page_message, has_approval, len(attachments), "user_no_attachment")
         store.mark_processed_message(message_id)
         return
 
@@ -696,8 +843,11 @@ def process_messaging_event(event: Dict[str, Any]) -> None:
         if stored:
             break
 
-    if not stored:
+    if stored:
+        store.record_webhook_event(message_id, sender_id, recipient_id, is_page_message, has_approval, len(attachments), "stored_pending")
+    else:
         logger.info("No supported image attachment was stored for message %s", message_id)
+        store.record_webhook_event(message_id, sender_id, recipient_id, is_page_message, has_approval, len(attachments), "unsupported_attachment")
     store.mark_processed_message(message_id)
 
 
@@ -711,7 +861,29 @@ def healthcheck():
             "pending_slips": store.count_pending(),
             "missing_env": missing_required_env(),
             "approval_reference_present": os.path.exists(CONFIG.approval_image_path),
+            "configured_fb_page_id_present": bool(CONFIG.fb_page_id),
+            "fb_page_token_page_id_present": bool(get_fb_page_self().get("id")),
+            "fb_page_id_matches_token": (
+                True
+                if not CONFIG.fb_page_id or not get_fb_page_self().get("id")
+                else CONFIG.fb_page_id == get_fb_page_self().get("id")
+            ),
             "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+    )
+
+
+@app.get("/debug/events")
+def recent_events():
+    token = request.args.get("token", "")
+    if not CONFIG.fb_verify_token or token != CONFIG.fb_verify_token:
+        return jsonify({"error": "forbidden"}), 403
+    limit = request.args.get("limit", "25")
+    return jsonify(
+        {
+            "status": "ok",
+            "pending_slips": store.count_pending(),
+            "events": store.recent_webhook_events(int(limit or 25)),
         }
     )
 
@@ -752,6 +924,7 @@ def main() -> None:
     logger.info("Starting fb_to_tg_bot")
     logger.info("Database: %s", CONFIG.db_path)
     logger.info("Missing env: %s", missing_required_env())
+    get_fb_page_self()
     load_reference_hash()
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
